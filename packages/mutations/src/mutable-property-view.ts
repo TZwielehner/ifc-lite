@@ -14,7 +14,7 @@
 
 import type { PropertyTable, PropertySet, Property, QuantitySet, Quantity } from '@ifc-lite/data';
 import { PropertyValueType, QuantityType } from '@ifc-lite/data';
-import type { PropertyValue, PropertyMutation, QuantityMutation, AttributeMutation, Mutation } from './types.js';
+import type { IfcAttributeValue, PropertyValue, PropertyMutation, QuantityMutation, AttributeMutation, Mutation, NewEntity } from './types.js';
 import { propertyKey, quantityKey, attributeKey, generateMutationId } from './types.js';
 
 /**
@@ -43,12 +43,50 @@ export class MutablePropertyView {
   private newPsets: Map<number, Map<string, PropertySet>> = new Map(); // entityId -> psetName -> PropertySet
   private newQsets: Map<number, Map<string, QuantitySet>> = new Map(); // entityId -> qsetName -> QuantitySet
   private attributeMutations: Map<string, AttributeMutation> = new Map(); // `${entityId}:attr:${attrName}`
+  private positionalAttrMutations: Map<number, Map<number, IfcAttributeValue>> = new Map(); // entityId -> argIndex -> value
+  private newEntities: Map<number, NewEntity> = new Map();
+  private tombstones: Set<number> = new Set();
+  /**
+   * Overlay-entity → source-entity aliases for property/quantity reads.
+   *
+   * When the viewer duplicates an existing entity, the new entity has
+   * no row in the parsed property table — `getBasePropertiesForEntity`
+   * would return `[]` and the property panel would show "No property
+   * sets". Aliasing redirects the BASE read to the source entity so
+   * the duplicate inherits its psets / qsets visually, while overlay
+   * mutations (overrides, creates, deletes) stay scoped to the
+   * overlay-entity's own id — so editing a property on the duplicate
+   * doesn't bleed into the source.
+   *
+   * Aliases follow at most one hop (no chains). They never affect
+   * STEP export — the export overlay emits the duplicate exactly as
+   * the StoreEditor recorded it, with whatever new IfcRel*ByProperties
+   * the caller chose to add.
+   */
+  private entityAliases: Map<number, number> = new Map();
+  private nextAllocatedId: number = 0;
   private mutationHistory: Mutation[] = [];
   private modelId: string;
 
   constructor(baseTable: PropertyTable | null, modelId: string) {
     this.baseTable = baseTable;
     this.modelId = modelId;
+  }
+
+  /**
+   * Seed the express-ID allocator. Should be called once after parsing with
+   * the highest existing expressId in the store; subsequent `createEntity`
+   * calls allocate IDs strictly above this watermark.
+   */
+  setExpressIdWatermark(maxExistingId: number): void {
+    if (maxExistingId > this.nextAllocatedId) {
+      this.nextAllocatedId = maxExistingId;
+    }
+  }
+
+  /** The next expressId that `createEntity` would allocate. */
+  peekNextExpressId(): number {
+    return this.nextAllocatedId + 1;
   }
 
   /**
@@ -68,13 +106,18 @@ export class MutablePropertyView {
 
   /**
    * Get base properties for an entity (before mutations)
-   * Uses on-demand extraction if available, otherwise falls back to base table
+   * Uses on-demand extraction if available, otherwise falls back to base table.
+   *
+   * Follows the entityAliases map for overlay duplicates so a fresh
+   * duplicate inherits its source's psets without paying the cost of
+   * eagerly cloning them into the overlay.
    */
   private getBasePropertiesForEntity(entityId: number): PropertySet[] {
+    const baseId = this.resolveBaseEntityId(entityId);
     // Prefer on-demand extraction if available (client-side WASM parsing)
     if (this.onDemandExtractor) {
       // Normalize the result to PropertySet[] (globalId defaults to empty string)
-      return this.onDemandExtractor(entityId).map(pset => ({
+      return this.onDemandExtractor(baseId).map(pset => ({
         name: pset.name,
         globalId: pset.globalId || '',
         properties: pset.properties.map(prop => ({
@@ -86,7 +129,7 @@ export class MutablePropertyView {
     }
     // Fallback to pre-built property table
     if (this.baseTable) {
-      return this.baseTable.getForEntity(entityId);
+      return this.baseTable.getForEntity(baseId);
     }
     return [];
   }
@@ -426,10 +469,14 @@ export class MutablePropertyView {
 
   /**
    * Get base quantities for an entity (before mutations)
+   *
+   * Follows the entityAliases map for overlay duplicates so a fresh
+   * duplicate inherits its source's qsets.
    */
   private getBaseQuantitiesForEntity(entityId: number): QuantitySet[] {
+    const baseId = this.resolveBaseEntityId(entityId);
     if (this.quantityExtractor) {
-      return this.quantityExtractor(entityId);
+      return this.quantityExtractor(baseId);
     }
     return [];
   }
@@ -660,6 +707,212 @@ export class MutablePropertyView {
   }
 
   /**
+   * Set a positional STEP argument on an entity by zero-based index.
+   *
+   * This is the only path for editing non-IfcRoot entities (e.g. profile
+   * dimensions on `IfcRectangleProfileDef`) where attributes have no symbolic
+   * names. Values follow the same conventions as `NewEntity.attributes`:
+   * numbers become `#expressId` references when paired with a reference slot,
+   * otherwise REAL/INTEGER literals; strings become quoted STEP strings;
+   * `null` becomes `$`.
+   */
+  setPositionalAttribute(
+    entityId: number,
+    index: number,
+    value: IfcAttributeValue,
+    skipHistory: boolean = false,
+  ): Mutation {
+    if (!Number.isInteger(index) || index < 0) {
+      throw new Error(`setPositionalAttribute: index must be a non-negative integer, got ${index}`);
+    }
+
+    let entityMap = this.positionalAttrMutations.get(entityId);
+    if (!entityMap) {
+      entityMap = new Map();
+      this.positionalAttrMutations.set(entityId, entityMap);
+    }
+    const oldValue = entityMap.has(index) ? entityMap.get(index)! : null;
+    entityMap.set(index, value);
+
+    const mutation: Mutation = {
+      id: generateMutationId(),
+      type: 'UPDATE_POSITIONAL_ATTRIBUTE',
+      timestamp: Date.now(),
+      modelId: this.modelId,
+      entityId,
+      attributeName: `@${index}`,
+      oldValue: oldValue as PropertyValue,
+      newValue: value as PropertyValue,
+    };
+
+    if (!skipHistory) {
+      this.mutationHistory.push(mutation);
+    }
+    return mutation;
+  }
+
+  /** Get all positional argument overrides for an entity, keyed by index. */
+  getPositionalMutationsForEntity(entityId: number): Map<number, IfcAttributeValue> | null {
+    return this.positionalAttrMutations.get(entityId) ?? null;
+  }
+
+  /**
+   * Drop a single positional override. Used by undo to roll a
+   * setPositionalAttribute back to "no override" when there was no prior
+   * value. Mirrors `removeAttributeMutation` for symmetric naming.
+   */
+  removePositionalMutation(entityId: number, index: number): void {
+    const entityMap = this.positionalAttrMutations.get(entityId);
+    if (!entityMap) return;
+    entityMap.delete(index);
+    if (entityMap.size === 0) {
+      this.positionalAttrMutations.delete(entityId);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Entity-level mutations (create / delete)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Create a new entity in the overlay. Returns the freshly-allocated
+   * expressId. Callers must ensure `setExpressIdWatermark` has been seeded
+   * from the underlying store before calling this for the first time.
+   */
+  createEntity(type: string, attributes: IfcAttributeValue[]): NewEntity {
+    if (!type || typeof type !== 'string') {
+      throw new Error('createEntity: type is required');
+    }
+    // Preserve the type string the caller passed (canonical PascalCase per
+    // the public contract). UPPERCASE STEP tokens still work because the
+    // STEP exporter upper-cases at write time — but `NewEntity.type` no
+    // longer mangles `IfcColumn` into `IFCCOLUMN` for downstream consumers.
+    const expressId = ++this.nextAllocatedId;
+    const entity: NewEntity = {
+      expressId,
+      type: type.trim(),
+      attributes: attributes.slice(),
+    };
+    this.newEntities.set(expressId, entity);
+
+    this.mutationHistory.push({
+      id: generateMutationId(),
+      type: 'CREATE_ENTITY',
+      timestamp: Date.now(),
+      modelId: this.modelId,
+      entityId: expressId,
+      attributeName: entity.type,
+    });
+    return entity;
+  }
+
+  /**
+   * Mark an entity for deletion. Existing entities are tombstoned; new
+   * entities (from `createEntity`) are simply forgotten. Returns false if
+   * the id is unknown to this view.
+   */
+  deleteEntity(expressId: number): boolean {
+    if (this.newEntities.has(expressId)) {
+      this.newEntities.delete(expressId);
+      this.mutationHistory.push({
+        id: generateMutationId(),
+        type: 'DELETE_ENTITY',
+        timestamp: Date.now(),
+        modelId: this.modelId,
+        entityId: expressId,
+      });
+      return true;
+    }
+    if (this.tombstones.has(expressId)) return false;
+    this.tombstones.add(expressId);
+    this.mutationHistory.push({
+      id: generateMutationId(),
+      type: 'DELETE_ENTITY',
+      timestamp: Date.now(),
+      modelId: this.modelId,
+      entityId: expressId,
+    });
+    return true;
+  }
+
+  /** Returns all overlay-created entities in insertion order. */
+  getNewEntities(): NewEntity[] {
+    return Array.from(this.newEntities.values());
+  }
+
+  /** Look up a single overlay-created entity. */
+  getNewEntity(expressId: number): NewEntity | null {
+    return this.newEntities.get(expressId) ?? null;
+  }
+
+  isDeleted(expressId: number): boolean {
+    return this.tombstones.has(expressId);
+  }
+
+  /**
+   * Reverse `deleteEntity` for an existing-entity tombstone. Returns true if
+   * a tombstone was removed; false if the id was not tombstoned. Used by
+   * undo of a DELETE_ENTITY mutation on a source-buffer entity. Overlay-only
+   * entities are restored via a separate path (`restoreNewEntity`).
+   */
+  restoreFromTombstone(expressId: number): boolean {
+    return this.tombstones.delete(expressId);
+  }
+
+  /**
+   * Alias an overlay-only entity to a source entity for property /
+   * quantity reads. Used by the duplicate flow so a fresh duplicate
+   * inherits its source's psets / qsets in the property panel without
+   * eagerly cloning them. Edits on the duplicate stay scoped to the
+   * duplicate's own id (override slots are keyed by entity id, not
+   * by base id).
+   *
+   * Pass `null` as the source to clear an existing alias.
+   */
+  setEntityAlias(overlayId: number, sourceId: number | null): void {
+    if (sourceId === null) {
+      this.entityAliases.delete(overlayId);
+      return;
+    }
+    if (sourceId === overlayId) return;
+    this.entityAliases.set(overlayId, sourceId);
+  }
+
+  /** Read the alias for a given overlay id, or null if none. */
+  getEntityAlias(overlayId: number): number | null {
+    return this.entityAliases.get(overlayId) ?? null;
+  }
+
+  /**
+   * Resolve to the base id used for property/quantity reads. Returns
+   * the input id when no alias is set. Aliases follow at most one
+   * hop — chained duplicates resolve to their immediate source, not
+   * the original.
+   */
+  resolveBaseEntityId(entityId: number): number {
+    return this.entityAliases.get(entityId) ?? entityId;
+  }
+
+  /**
+   * Re-add an overlay-only entity to `newEntities`. Pairs with `deleteEntity`
+   * to support undo of a freshly-created-and-then-deleted entity. The caller
+   * is responsible for stashing the `NewEntity` record between delete and
+   * restore (the slice's undo stack does this).
+   */
+  restoreNewEntity(entity: NewEntity): void {
+    this.newEntities.set(entity.expressId, entity);
+    // Without this the next createEntity() can hand out the same id and
+    // overwrite the restored entity.
+    if (entity.expressId > this.nextAllocatedId) {
+      this.nextAllocatedId = entity.expressId;
+    }
+  }
+
+  getTombstones(): Set<number> {
+    return new Set(this.tombstones);
+  }
+
+  /**
    * Get mutated attributes for an entity.
    * Returns only attributes that have been added/modified via mutations.
    */
@@ -760,6 +1013,11 @@ export class MutablePropertyView {
     this.deletedQsets.clear();
     this.newPsets.clear();
     this.newQsets.clear();
+    this.positionalAttrMutations.clear();
+    this.newEntities.clear();
+    this.tombstones.clear();
+    this.entityAliases.clear();
+    this.nextAllocatedId = 0;
     this.mutationHistory = [];
   }
 
@@ -767,6 +1025,13 @@ export class MutablePropertyView {
    * Apply a batch of mutations (e.g., from imported change set)
    */
   applyMutations(mutations: Mutation[]): void {
+    // CREATE_ENTITY records are skipped (callers must restore the
+    // payload via restoreNewEntity). Track the ids we've skipped so a
+    // matching DELETE_ENTITY in the same batch doesn't tombstone an
+    // entity that never made it into this view — that stale tombstone
+    // would later suppress a freshly-allocated overlay entity reusing
+    // the same expressId.
+    const skippedCreateIds = new Set<number>();
     for (const mutation of mutations) {
       switch (mutation.type) {
         case 'CREATE_PROPERTY':
@@ -805,6 +1070,41 @@ export class MutablePropertyView {
               QuantityType.Count,
             );
           }
+          break;
+
+        case 'UPDATE_POSITIONAL_ATTRIBUTE': {
+          // attributeName is `@<index>` for positional mutations.
+          const attr = mutation.attributeName ?? '';
+          if (!attr.startsWith('@')) break;
+          const index = Number(attr.slice(1));
+          if (!Number.isInteger(index) || index < 0) break;
+          if (mutation.newValue === undefined) break;
+          this.setPositionalAttribute(
+            mutation.entityId,
+            index,
+            mutation.newValue as IfcAttributeValue,
+          );
+          break;
+        }
+
+        case 'CREATE_ENTITY': {
+          // Replay creates rely on the importer providing the entity body
+          // via `restoreNewEntity` separately. The history record alone
+          // doesn't carry the type+attributes payload — applying a bare
+          // CREATE_ENTITY would lose the entity. We log and skip rather
+          // than silently dropping it, so callers see they need to
+          // restore the payload through the dedicated path.
+          skippedCreateIds.add(mutation.entityId);
+          // eslint-disable-next-line no-console
+          console.warn(
+            `applyMutations: CREATE_ENTITY for #${mutation.entityId} requires a NewEntity payload — restore via restoreNewEntity()`,
+          );
+          break;
+        }
+
+        case 'DELETE_ENTITY':
+          if (skippedCreateIds.has(mutation.entityId)) break;
+          this.deleteEntity(mutation.entityId);
           break;
       }
     }

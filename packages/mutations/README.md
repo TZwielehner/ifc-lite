@@ -10,6 +10,8 @@ npm install @ifc-lite/mutations
 
 ## Edit a property
 
+### Property edits
+
 ```typescript
 import { MutablePropertyView } from '@ifc-lite/mutations';
 import { PropertyValueType } from '@ifc-lite/data';
@@ -29,6 +31,34 @@ console.log(`${mutation.oldValue} → ${mutation.newValue}`);
 // Reads return the new value transparently
 view.getPropertyValue(wallExpressId, 'Pset_WallCommon', 'FireRating'); // 'REI 120'
 ```
+
+### Store-level edits
+
+For raw STEP edits — adding entities, deleting them, overriding positional
+arguments on entities without symbolic attribute names — pair the view with
+a `StoreEditor`:
+
+```typescript
+import { MutablePropertyView, StoreEditor } from '@ifc-lite/mutations';
+
+const view = new MutablePropertyView(propertyTable, modelId);
+const editor = new StoreEditor(dataStore, view);
+
+// Add a fresh entity (e.g. an IfcRectangleProfileDef)
+const profile = editor.addEntity('IfcRectangleProfileDef', [
+  '.AREA.', null, '#34', 0.6, 0.4,
+]);
+
+// Override a single positional STEP arg by index (zero-based)
+editor.setPositionalAttribute(profile.expressId, 3, 0.7);  // XDim → 0.7
+
+// Tombstone an entity
+editor.removeEntity(unwantedExpressId);
+```
+
+Edits accumulate in the same overlay used by `setProperty` / `setAttribute`
+and materialise the next time you call
+`StepExporter.export({ applyMutations: true })`.
 
 ## Mutation history (for undo / export)
 
@@ -122,6 +152,17 @@ const restored = manager.importChangeSet(json);
 ```
 
 Pair this with `exportToStep(store, { applyMutations: true })` from `@ifc-lite/export` to write a real `.ifc` file with the changes baked in.
+
+## Features
+
+- Mutation overlay on read-only IFC data
+- Undo/redo support (via viewer store)
+- Change sets for grouping related mutations
+- Bulk query engine for updating many entities
+- CSV import for spreadsheet-based updates
+- **Store-level edits**: `StoreEditor` for `addEntity` / `removeEntity` /
+  `setPositionalAttribute` over a parsed `IfcDataStore`
+- Export modified data
 
 ## API
 

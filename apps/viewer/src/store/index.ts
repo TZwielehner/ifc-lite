@@ -38,6 +38,8 @@ import { createScheduleSlice, type ScheduleSlice } from './slices/scheduleSlice.
 import { createPlaybackSlice, type PlaybackSlice } from './slices/playbackSlice.js';
 import { createOverlaySlice, type OverlaySlice } from './slices/overlaySlice.js';
 import { createSearchSlice, type SearchSlice } from './slices/searchSlice.js';
+import { createAnnotationsSlice, type AnnotationsSlice } from './slices/annotationsSlice.js';
+import { createAddElementSlice, type AddElementSlice } from './slices/addElementSlice.js';
 import { invalidateVisibleBasketCache } from './basketVisibleSet.js';
 
 // Import constants for reset function
@@ -128,7 +130,9 @@ export type ViewerState = LoadingSlice &
   ScheduleSlice &
   PlaybackSlice &
   OverlaySlice &
-  SearchSlice & {
+  SearchSlice &
+  AnnotationsSlice &
+  AddElementSlice & {
     resetViewerState: () => void;
   };
 
@@ -163,6 +167,8 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
   ...createPlaybackSlice(...args),
   ...createOverlaySlice(...args),
   ...createSearchSlice(...args),
+  ...createAnnotationsSlice(...args),
+  ...createAddElementSlice(...args),
 
   // Reset all viewer state when loading new file
   // Note: Does NOT clear models - use clearAllModels() for that
@@ -403,6 +409,12 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
       searchFilterError: null,
       searchFilter: { rules: [], combinator: 'AND', limit: 500 },
       searchFilterSchema: new Map(),
+
+      // Annotations — drop draft + selection so a new file doesn't
+      // inherit the previous file's pin authoring state. Persisted
+      // pins themselves stay in localStorage (cross-file workspace).
+      draft: null,
+      selectedAnnotationId: null,
     });
   },
 }));

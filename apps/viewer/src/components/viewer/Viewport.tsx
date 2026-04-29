@@ -456,10 +456,20 @@ export function Viewport({
     }
 
     // Set cursor based on active tool
-    if (activeTool === 'measure') {
+    if (activeTool === 'measure' || activeTool === 'annotate' || activeTool === 'addElement') {
       canvas.style.cursor = 'crosshair';
     } else {
       canvas.style.cursor = 'default';
+    }
+
+    // Clear add-element pending state + hover point when leaving the
+    // tool so the SVG overlay doesn't paint stale geometry from a
+    // previous session.
+    if (activeTool !== 'addElement') {
+      const state = useViewerStore.getState();
+      if (state.addElementPendingPoints.length > 0 || state.addElementHoverPoint !== null) {
+        state.clearAddElementPending();
+      }
     }
   }, [activeTool, activeMeasurement, cancelMeasurement]);
 

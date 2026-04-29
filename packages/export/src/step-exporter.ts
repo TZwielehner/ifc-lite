@@ -9,7 +9,7 @@
  * Supports applying property and root attribute mutations before export.
  */
 
-import type { IfcDataStore } from '@ifc-lite/parser';
+import type { IfcDataStore, IfcAttributeValue } from '@ifc-lite/parser';
 import {
   EntityExtractor,
   generateHeader,
@@ -30,6 +30,8 @@ import {
   quantityTypeToIfcType,
   serializePropertyValue,
   serializeAttributeValue,
+  serializeStepArgs,
+  serializeStepValue,
   splitTopLevelArgs,
   splitTopLevelStepArguments,
 } from './step-serialization.js';
@@ -127,8 +129,11 @@ export class StepExporter {
   constructor(dataStore: IfcDataStore, mutationView?: MutablePropertyView) {
     this.dataStore = dataStore;
     this.mutationView = mutationView || null;
-    // Start new IDs after the highest existing ID
-    this.nextExpressId = this.findMaxExpressId() + 1;
+    const maxExisting = this.findMaxExpressId();
+    const overlayWatermark = typeof mutationView?.peekNextExpressId === 'function'
+      ? mutationView.peekNextExpressId() - 1
+      : 0;
+    this.nextExpressId = Math.max(maxExisting, overlayWatermark) + 1;
     this.entityExtractor = dataStore.source ? new EntityExtractor(dataStore.source) : null;
   }
 
@@ -436,8 +441,22 @@ export class StepExporter {
       }
     }
 
-    // If delta only, only export modified entities
-    if (options.deltaOnly && modifiedEntities.size === 0) {
+    // If delta only, only export modified entities. Overlay-created entities
+    // also count — without this, `createEntity()`-only edits would silently
+    // drop out of delta exports.
+    const overlayNewEntityCount = (
+      this.mutationView
+      && options.applyMutations !== false
+      && typeof this.mutationView.getNewEntities === 'function'
+    ) ? this.mutationView.getNewEntities().length : 0;
+    // Georef-only deltas (newGeorefLines populated but no entity changes) must
+    // still produce a non-empty DATA section.
+    if (
+      options.deltaOnly
+      && modifiedEntities.size === 0
+      && overlayNewEntityCount === 0
+      && newGeorefLines.length === 0
+    ) {
       const emptyContent = new TextEncoder().encode(header + 'DATA;\nENDSEC;\nEND-ISO-10303-21;\n');
       return {
         content: emptyContent,
@@ -480,7 +499,18 @@ export class StepExporter {
       const source = this.dataStore.source;
 
       // Extract existing entities from source
+      const overlayActive = !!this.mutationView && (options.applyMutations !== false);
       for (const [expressId, entityRef] of this.dataStore.entityIndex.byId) {
+        // Skip entities deleted via the overlay (only when mutations are applied)
+        if (overlayActive && typeof this.mutationView!.isDeleted === 'function' && this.mutationView!.isDeleted(expressId)) {
+          continue;
+        }
+
+        // Skip overlay-only entities — emitted by the new-entities pass below
+        if (entityRef.byteLength === 0 || entityRef.byteOffset < 0) {
+          continue;
+        }
+
         // Skip entities outside the visible closure
         if (allowedEntityIds !== null && !allowedEntityIds.has(expressId)) {
           continue;
@@ -508,9 +538,20 @@ export class StepExporter {
         const entityText = decoder.decode(
           source.subarray(entityRef.byteOffset, entityRef.byteOffset + entityRef.byteLength)
         );
-        const nextEntityText = modifiedAttributes.has(expressId)
+        let nextEntityText = modifiedAttributes.has(expressId)
           ? this.applyAttributeMutations(entityText, entityType, modifiedAttributes.get(expressId)!)
           : entityText;
+
+        const positional = overlayActive && typeof this.mutationView!.getPositionalMutationsForEntity === 'function'
+          ? this.mutationView!.getPositionalMutationsForEntity(expressId)
+          : null;
+        if (positional && positional.size > 0) {
+          nextEntityText = this.applyPositionalMutations(nextEntityText, positional);
+          if (!modifiedEntities.has(expressId)) {
+            modifiedEntities.add(expressId);
+            modifiedEntityCount++;
+          }
+        }
 
         // Apply schema conversion if exporting to a different schema version
         if (converting) {
@@ -577,6 +618,41 @@ export class StepExporter {
     // Add new georeferencing entities (IfcProjectedCRS, IfcMapConversion)
     for (const line of newGeorefLines) {
       entities.push(line);
+    }
+
+    // Add overlay-created entities (store.addEntity / mutationView.createEntity).
+    // Apply the same filters as the source-iteration pass so newly-created
+    // beams/slabs don't smuggle their geometry helpers (IfcCartesianPoint,
+    // IfcExtrudedAreaSolid, etc.) past `includeGeometry:false` /
+    // `exportPropertiesOnly()` modes.
+    if (
+      this.mutationView
+      && (options.applyMutations !== false)
+      && typeof this.mutationView.getNewEntities === 'function'
+    ) {
+      for (const entity of this.mutationView.getNewEntities()) {
+        // STEP requires UPPERCASE entity type tokens. `NewEntity.type` is
+        // stored in canonical PascalCase per the public API contract; the
+        // upper-case happens here at the file-format boundary.
+        const upperType = entity.type.toUpperCase();
+        if (options.includeGeometry === false && this.isGeometryEntity(upperType)) {
+          continue;
+        }
+        if (allowedEntityIds !== null && !allowedEntityIds.has(entity.expressId)) {
+          continue;
+        }
+        const line = `#${entity.expressId}=${upperType}(${serializeStepArgs(entity.attributes)});`;
+        if (converting) {
+          const converted = convertStepLine(line, sourceSchema, schema);
+          if (converted !== null) {
+            entities.push(converted);
+            newEntityCount++;
+          }
+        } else {
+          entities.push(line);
+          newEntityCount++;
+        }
+      }
     }
 
     // Assemble final file as Uint8Array chunks to avoid V8 string length limit
@@ -768,6 +844,31 @@ export class StepExporter {
       return entityText;
     }
 
+    return `${entityText.slice(0, openParen + 1)}${args.join(',')}${entityText.slice(closeParen)}`;
+  }
+
+  /**
+   * Apply positional STEP argument overrides to an entity line.
+   * Used for non-IfcRoot edits (e.g. profile dimensions) where attributes
+   * have no symbolic names. Indexes that fall outside the existing arg list
+   * are silently ignored.
+   */
+  private applyPositionalMutations(
+    entityText: string,
+    positionals: Map<number, IfcAttributeValue>,
+  ): string {
+    const openParen = entityText.indexOf('(');
+    const closeParen = entityText.lastIndexOf(');');
+    if (openParen < 0 || closeParen < openParen) return entityText;
+
+    const args = splitTopLevelArgs(entityText.slice(openParen + 1, closeParen));
+    let changed = false;
+    for (const [index, value] of positionals) {
+      if (index < 0 || index >= args.length) continue;
+      args[index] = serializeStepValue(value);
+      changed = true;
+    }
+    if (!changed) return entityText;
     return `${entityText.slice(0, openParen + 1)}${args.join(',')}${entityText.slice(closeParen)}`;
   }
 
