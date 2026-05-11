@@ -41,6 +41,7 @@ import {
 import { getGlobalRenderer } from './useBCF.js';
 import { readNativeFile, type NativeFileHandle } from '../services/file-dialog.js';
 import { getEffectiveGeoreference, getEffectiveHorizontalScale, type GeorefMutationDataLike } from '../lib/geo/effective-georef.js';
+import { acquireFederationLoadSlot, releaseFederationLoadSlot } from './federationLoadGate.js';
 
 function isNativeFileHandle(file: File | NativeFileHandle): file is NativeFileHandle {
   return typeof (file as NativeFileHandle).path === 'string';
@@ -400,7 +401,16 @@ export function useIfcFederation() {
   ): Promise<string | null> => {
     const modelId = options?.modelId ?? crypto.randomUUID();
     const addStart = performance.now();
+    // Bump the per-call ownership token first so that any error path
+    // (including the load gate) can compare against this captured value
+    // before mutating shared loading/error/progress state.
     const currentSession = ++loadSessionRef.current;
+    // Memory-aware load gate: if a previous federation load is still in
+    // flight on this tab and admitting this one would exceed the device
+    // memory budget, wait until headroom frees. Single-file loads never
+    // wait. See `federationLoadGate.ts` for the budget formula. (#600)
+    const fileSizeForGateMB = (typeof (file as File).size === 'number' ? (file as File).size : 0) / (1024 * 1024);
+    const gateSlot = await acquireFederationLoadSlot(fileSizeForGateMB);
     try {
       // IMPORTANT: Before adding a new model, check if there's a legacy model
       // (loaded via loadFile) that's not in the Map yet. If so, migrate it first.
@@ -701,6 +711,8 @@ export function useIfcFederation() {
         setLoading(false);
       }
       return null;
+    } finally {
+      releaseFederationLoadSlot(gateSlot);
     }
   }, [setLoading, setError, setProgress, setIfcDataStore, setGeometryResult, storeAddModel, hasModels, registerModelOffset]);
 
