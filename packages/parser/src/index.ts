@@ -115,6 +115,7 @@ import { EntityExtractor } from './entity-extractor.js';
 import { PropertyExtractor } from './property-extractor.js';
 import { RelationshipExtractor } from './relationship-extractor.js';
 import { ColumnarParser, type IfcDataStore } from './columnar-parser.js';
+import { OpfsSourceBuffer } from './opfs-source-buffer.js';
 import { scanEntitiesInWorker } from './scan-worker-inline.js';
 import { buildEntityRefsFromIndex } from './entity-refs-from-index.js';
 import { safeUtf8Decode } from '@ifc-lite/data';
@@ -590,4 +591,52 @@ export async function parseAuto(
   }
 
   throw new Error('Unknown file format. Expected IFC (STEP) or IFCX (JSON).');
+}
+
+/**
+ * Parse an IFC/IFCX source that lives in OPFS (or in-memory fallback).
+ *
+ * Why this exists: large IFCs (≥ ~500 MiB) hit per-tab ArrayBuffer caps
+ * in the browser when held as a single transferred buffer. `OpfsSourceBuffer`
+ * lets the caller stage the source on disk first and only keep a handle in
+ * memory. This entry point is the bridge — callers don't have to know about
+ * the underlying storage.
+ *
+ * Status (v0 — API shape):
+ *   - Format detection + parse currently materialise the full source via
+ *     `source.subarray(0, source.byteLength)`. For OPFS-backed sources that
+ *     allocates a fresh Uint8Array and copies the bytes from disk once,
+ *     matching the cost of the existing `parseAuto(ArrayBuffer)` path. No
+ *     persistent ArrayBuffer is held by THIS function after the call returns
+ *     — the caller can keep only the `OpfsSourceBuffer` handle for later
+ *     range reads.
+ *   - TODO (follow-up PR): thread `OpfsSourceBuffer` through `ColumnarParser`
+ *     and the `extractRelFast` / `extractPropertyRelFast` byte-scan helpers
+ *     so the parser reads ranges directly from OPFS without the full
+ *     materialise. That delivers the "never hold N bytes in RAM" win the
+ *     class was designed for.
+ */
+export async function parseAutoFromOpfsSource(
+  source: OpfsSourceBuffer,
+  options: ParseOptions = {},
+): Promise<AutoParseResult> {
+  // One materialise — yields a Uint8Array view over a fresh ArrayBuffer
+  // when the source is OPFS-backed (1× input alloc). For in-memory
+  // sources `subarray` returns a zero-copy view; we then re-wrap into a
+  // fresh ArrayBuffer to keep the format-detect / parseColumnar contracts
+  // stable. The temporary buffer is reachable only via the local
+  // `materialised` reference, so V8 can reclaim it as soon as parseAuto
+  // returns.
+  const materialised = source.subarray(0, source.byteLength);
+  // Detach a fresh ArrayBuffer so parseAuto's `new Uint8Array(buffer)`
+  // path doesn't end up aliased with the caller's storage. .slice on a
+  // Uint8Array returns a copy of the underlying ArrayBuffer; for OPFS
+  // sources `subarray` already returned a fresh allocation so .slice is
+  // cheap; for in-memory sources it pays one extra copy to keep the
+  // semantics uniform.
+  const buffer = materialised.buffer.slice(
+    materialised.byteOffset,
+    materialised.byteOffset + materialised.byteLength,
+  ) as ArrayBuffer;
+  return parseAuto(buffer, options);
 }
