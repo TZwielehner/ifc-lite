@@ -59,7 +59,7 @@ export function extractClassificationsOnDemand(
     }
 
     if (!classRefIds || classRefIds.length === 0) return [];
-    if (!store.source?.length) return [];
+    if (!store.source?.byteLength) return [];
 
     const extractor = new EntityExtractor(store.source);
     const results: ClassificationInfo[] = [];

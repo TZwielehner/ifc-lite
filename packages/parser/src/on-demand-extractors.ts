@@ -368,7 +368,7 @@ export function extractTypePropertiesOnDemand(
     const typeRef = store.entityIndex.byId.get(typeId);
     if (!typeRef) return null;
 
-    if (!store.source?.length) return null;
+    if (!store.source?.byteLength) return null;
 
     const extractor = new EntityExtractor(store.source);
 
@@ -427,7 +427,7 @@ export function extractTypeEntityOwnProperties(
     typeEntityId: number
 ): Array<{ name: string; globalId?: string; properties: Array<{ name: string; type: number; value: PropertyValue; values?: string[] }> }> {
     const ref = store.entityIndex.byId.get(typeEntityId);
-    if (!ref || !store.source?.length) return [];
+    if (!ref || !store.source?.byteLength) return [];
 
     const extractor = new EntityExtractor(store.source);
     const typeEntity = extractor.extractEntity(ref);
@@ -505,7 +505,7 @@ export function extractDocumentsOnDemand(
     }
 
     if (!docRefIds || docRefIds.length === 0) return [];
-    if (!store.source?.length) return [];
+    if (!store.source?.byteLength) return [];
 
     const extractor = new EntityExtractor(store.source);
     const results: DocumentInfo[] = [];
@@ -645,7 +645,7 @@ export function extractRelationshipsOnDemand(
  * Bridges to the entity-based georef extractor by resolving entities lazily.
  */
 export function extractGeoreferencingOnDemand(store: IfcDataStore): GeoreferenceInfo | null {
-    if (!store.source?.length || !store.entityIndex) return null;
+    if (!store.source?.byteLength || !store.entityIndex) return null;
 
     const extractor = new EntityExtractor(store.source);
     const { byId, byType } = store.entityIndex;

@@ -18,7 +18,7 @@ export { RelationshipExtractor } from './relationship-extractor.js';
 export { StyleExtractor } from './style-extractor.js';
 export { SpatialHierarchyBuilder } from './spatial-hierarchy-builder.js';
 export { extractLengthUnitScale } from './unit-extractor.js';
-export { ColumnarParser, type IfcDataStore, type EntityByIdIndex, extractPropertiesOnDemand, extractQuantitiesOnDemand, extractEntityAttributesOnDemand, extractAllEntityAttributes, extractClassificationsOnDemand, extractMaterialsOnDemand, extractTypePropertiesOnDemand, extractTypeEntityOwnProperties, extractDocumentsOnDemand, extractRelationshipsOnDemand, extractGeoreferencingOnDemand, type ClassificationInfo, type MaterialInfo, type MaterialLayerInfo, type MaterialProfileInfo, type MaterialConstituentInfo, type TypePropertyInfo, type DocumentInfo, type EntityRelationships } from './columnar-parser.js';
+export { ColumnarParser, type IfcDataStore, type SourceReader, type EntityByIdIndex, extractPropertiesOnDemand, extractQuantitiesOnDemand, extractEntityAttributesOnDemand, extractAllEntityAttributes, extractClassificationsOnDemand, extractMaterialsOnDemand, extractTypePropertiesOnDemand, extractTypeEntityOwnProperties, extractDocumentsOnDemand, extractRelationshipsOnDemand, extractGeoreferencingOnDemand, type ClassificationInfo, type MaterialInfo, type MaterialLayerInfo, type MaterialProfileInfo, type MaterialConstituentInfo, type TypePropertyInfo, type DocumentInfo, type EntityRelationships } from './columnar-parser.js';
 // WorkerParser is browser-only due to Vite worker imports
 // Import from '@ifc-lite/parser/browser' instead
 
@@ -114,7 +114,7 @@ import { EntityIndexBuilder } from './entity-index.js';
 import { EntityExtractor } from './entity-extractor.js';
 import { PropertyExtractor } from './property-extractor.js';
 import { RelationshipExtractor } from './relationship-extractor.js';
-import { ColumnarParser, type IfcDataStore } from './columnar-parser.js';
+import { ColumnarParser, type IfcDataStore, type SourceReader } from './columnar-parser.js';
 import { OpfsSourceBuffer } from './opfs-source-buffer.js';
 import { scanEntitiesInWorker } from './scan-worker-inline.js';
 import { buildEntityRefsFromIndex } from './entity-refs-from-index.js';
@@ -146,6 +146,14 @@ export interface ParseOptions {
     starts: Uint32Array;
     lengths: Uint32Array;
   };
+  /**
+   * Range-readable source to retain as `store.source` instead of the
+   * materialized scan buffer. When set (e.g. by `parseAutoFromOpfsSource`
+   * with an OPFS-backed `OpfsSourceBuffer`), the contiguous `buffer` is used
+   * only for the scan and is freed afterwards; on-demand extraction then
+   * reads byte ranges from here. Must address the same bytes as `buffer`.
+   */
+  sourceReader?: SourceReader;
 }
 
 /**
@@ -602,19 +610,17 @@ export async function parseAuto(
  * memory. This entry point is the bridge — callers don't have to know about
  * the underlying storage.
  *
- * Status (v0 — API shape):
- *   - Format detection + parse currently materialise the full source via
- *     `source.subarray(0, source.byteLength)`. For OPFS-backed sources that
- *     allocates a fresh Uint8Array and copies the bytes from disk once,
- *     matching the cost of the existing `parseAuto(ArrayBuffer)` path. No
- *     persistent ArrayBuffer is held by THIS function after the call returns
- *     — the caller can keep only the `OpfsSourceBuffer` handle for later
- *     range reads.
- *   - TODO (follow-up PR): thread `OpfsSourceBuffer` through `ColumnarParser`
- *     and the `extractRelFast` / `extractPropertyRelFast` byte-scan helpers
- *     so the parser reads ranges directly from OPFS without the full
- *     materialise. That delivers the "never hold N bytes in RAM" win the
- *     class was designed for.
+ * Memory model:
+ *   - The scan pass still materializes the source once into a contiguous
+ *     buffer (read from OPFS for OPFS-backed sources) — the WASM scanner and
+ *     the `extractRelFast` / `extractPropertyRelFast` byte-scan helpers need a
+ *     flat `Uint8Array`. That buffer is transient.
+ *   - The returned store retains the `OpfsSourceBuffer` as `store.source`
+ *     (threaded via `ParseOptions.sourceReader`), so once this returns the
+ *     transient scan buffer is unreferenced and freed, and all on-demand
+ *     extraction reads byte RANGES from disk — the parser never pins the full
+ *     N bytes in the JS heap after the scan. (Chunking the scan itself so even
+ *     parse never holds the full buffer is the remaining follow-up.)
  */
 export async function parseAutoFromOpfsSource(
   source: OpfsSourceBuffer,
@@ -627,16 +633,26 @@ export async function parseAutoFromOpfsSource(
   // stable. The temporary buffer is reachable only via the local
   // `materialised` reference, so V8 can reclaim it as soon as parseAuto
   // returns.
+  // Materialize once for the scan + format detection — the WASM scanner and
+  // the byte-scan helpers need a contiguous buffer. For OPFS-backed sources
+  // `subarray` already returned a fresh, exactly-sized ArrayBuffer, so we pass
+  // it straight through (no second copy). Only the in-memory fallback (a view
+  // that may sit at a nonzero offset) needs a slice to detach the exact range.
   const materialised = source.subarray(0, source.byteLength);
-  // Detach a fresh ArrayBuffer so parseAuto's `new Uint8Array(buffer)`
-  // path doesn't end up aliased with the caller's storage. .slice on a
-  // Uint8Array returns a copy of the underlying ArrayBuffer; for OPFS
-  // sources `subarray` already returned a fresh allocation so .slice is
-  // cheap; for in-memory sources it pays one extra copy to keep the
-  // semantics uniform.
-  const buffer = materialised.buffer.slice(
-    materialised.byteOffset,
-    materialised.byteOffset + materialised.byteLength,
+  const exact =
+    materialised.byteOffset === 0 &&
+    materialised.byteLength === materialised.buffer.byteLength;
+  const buffer = (
+    exact
+      ? materialised.buffer
+      : materialised.buffer.slice(
+          materialised.byteOffset,
+          materialised.byteOffset + materialised.byteLength,
+        )
   ) as ArrayBuffer;
-  return parseAuto(buffer, options);
+  // Thread the OpfsSourceBuffer through as the store's retained source: the
+  // parse scans `buffer` transiently, but the returned store reads on-demand
+  // ranges from `source` (disk for OPFS), so the full N bytes are not pinned
+  // in the JS heap after this returns.
+  return parseAuto(buffer, { ...options, sourceReader: source });
 }

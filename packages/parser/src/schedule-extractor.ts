@@ -375,7 +375,7 @@ function extractLagTimeSeconds(
  * and assembles a connected ScheduleExtraction.
  */
 export function extractScheduleOnDemand(store: IfcDataStore): ScheduleExtraction {
-  if (!store.source?.length) {
+  if (!store.source?.byteLength) {
     return { workSchedules: [], tasks: [], sequences: [], hasSchedule: false };
   }
 

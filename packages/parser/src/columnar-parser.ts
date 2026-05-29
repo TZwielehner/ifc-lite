@@ -48,13 +48,27 @@ import type { SpatialIndex, EntityByIdIndex } from './columnar-parser-indexes.js
 // Re-export interfaces/types from extracted modules for public API compatibility
 export type { SpatialIndex, EntityByIdIndex } from './columnar-parser-indexes.js';
 
+/**
+ * Range-readable view over the source bytes. Satisfied structurally by both a
+ * plain `Uint8Array` (in-memory path) and `OpfsSourceBuffer` (OPFS/disk-backed
+ * path) — `Uint8Array.subarray`'s optional params are assignable to the
+ * required ones here, and both expose `byteLength`. The store holds the source
+ * through this seam so on-demand extraction reads byte ranges (zero-copy view
+ * in memory, or a disk read for OPFS) without the parser ever pinning the full
+ * N bytes in the JS heap after the scan. See opfs-source-buffer.ts.
+ */
+export interface SourceReader {
+    readonly byteLength: number;
+    subarray(start: number, end: number): Uint8Array;
+}
+
 export interface IfcDataStore {
     fileSize: number;
     schemaVersion: 'IFC2X3' | 'IFC4' | 'IFC4X3' | 'IFC5';
     entityCount: number;
     parseTime: number;
 
-    source: Uint8Array;
+    source: SourceReader;
     entityIndex: { byId: EntityByIdIndex; byType: Map<string, number[]> };
     deferredEntityIndex?: EntityByIdIndex;
 
@@ -154,6 +168,15 @@ export class ColumnarParser {
             yieldIntervalMs?: number;
             deferPropertyAtomIndex?: boolean;
             onSpatialReady?: (partialStore: IfcDataStore) => void;
+            /**
+             * When set, the returned store retains THIS as `store.source` (a
+             * range-readable OpfsSourceBuffer) instead of the materialized scan
+             * buffer. The scan still runs over the contiguous `buffer` arg, but
+             * once parsing returns, that buffer is unreferenced and freed, and
+             * on-demand extraction reads byte ranges from here (disk for OPFS).
+             * Must address the same bytes as `buffer`.
+             */
+            sourceReader?: SourceReader;
         } = {}
     ): Promise<IfcDataStore> {
         const startTime = performance.now();
@@ -508,7 +531,12 @@ export class ColumnarParser {
             schemaVersion,
             entityCount: totalEntities,
             parseTime: performance.now() - startTime,
-            source: uint8Buffer,
+            // Retain the range-readable source when the caller supplied one
+            // (OPFS-backed). The scan above used `uint8Buffer` (materialized
+            // for the WASM/byte-scan helpers); once this function returns it is
+            // unreferenced and freed, so the store no longer pins the full N
+            // bytes — on-demand extraction reads ranges from `sourceReader`.
+            source: options.sourceReader ?? uint8Buffer,
             entityIndex,
             strings,
             entities: entityTable,
@@ -651,7 +679,7 @@ export class ColumnarParser {
         entityId: number
     ): Array<{ name: string; globalId?: string; properties: Array<{ name: string; type: number; value: PropertyValue; values?: string[]; dataType?: string }> }> {
         // Use on-demand extraction if map is available (preferred for single-entity access)
-        if (!store.onDemandPropertyMap || !store.source?.length) {
+        if (!store.onDemandPropertyMap || !store.source?.byteLength) {
             // Fallback to pre-computed property table (e.g., server-parsed data)
             return store.properties.getForEntity(entityId);
         }
@@ -721,7 +749,7 @@ export class ColumnarParser {
         entityId: number
     ): Array<{ name: string; quantities: Array<{ name: string; type: number; value: number }> }> {
         // Use on-demand extraction if map is available (preferred for single-entity access)
-        if (!store.onDemandQuantityMap || !store.source?.length) {
+        if (!store.onDemandQuantityMap || !store.source?.byteLength) {
             // Fallback to pre-computed quantity table (e.g., server-parsed data)
             return store.quantities.getForEntity(entityId);
         }

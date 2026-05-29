@@ -96,7 +96,7 @@ export function extractMaterialsOnDemand(
     }
 
     if (materialId === undefined) return null;
-    if (!store.source?.length) return null;
+    if (!store.source?.byteLength) return null;
 
     const extractor = new EntityExtractor(store.source);
     return resolveMaterial(store, extractor, materialId, new Set());
