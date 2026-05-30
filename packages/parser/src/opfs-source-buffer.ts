@@ -53,6 +53,22 @@ export class OpfsSourceBuffer {
   /** OPFS file name (for cleanup) */
   private opfsFileName: string | null = null;
 
+  /**
+   * Sliding read-window size for the OPFS-backed path. One handle.read() fills
+   * the window; subsequent readRange() calls inside it are served by an
+   * in-memory copy instead of a fresh OPFS read. Without this, the fix loop's
+   * per-entity reads (millions of them) each hit the disk — the same syscall
+   * storm that froze the Node CLI path before its window cache. A file larger
+   * than the window slides (bounded source footprint); files at/under it are
+   * cached whole. Mutable for tests. Mirrors the CLI's IFC_SOURCE_WINDOW_MIB
+   * (default 256 MiB).
+   */
+  static windowBytes = 256 * 1024 * 1024;
+  /** OPFS read window (lazily allocated on first OPFS read; null in-memory). */
+  private window: Uint8Array | null = null;
+  private winStart = 0;
+  private winLen = 0;
+
   private constructor(
     memoryBuffer: Uint8Array | null,
     byteLength: number,
@@ -144,15 +160,51 @@ export class OpfsSourceBuffer {
     }
 
     if (this.fileHandle) {
-      // OPFS sync access: read into a new buffer
-      const dest = new Uint8Array(byteLength);
-      const bytesRead = this.fileHandle.read(dest, { at: byteOffset });
-      if (bytesRead < byteLength) {
-        throw new Error(
-          `OpfsSourceBuffer.readRange: short read (${bytesRead}/${byteLength} bytes at offset ${byteOffset})`
-        );
+      const cap = Math.min(
+        OpfsSourceBuffer.windowBytes,
+        Math.max(this.byteLength, 1)
+      );
+
+      // Range larger than the window: bypass it with a direct read (rare —
+      // e.g. a whole-source materialize on a >window file). Leaves the window
+      // untouched.
+      if (byteLength > cap) {
+        const dest = new Uint8Array(byteLength);
+        const bytesRead = this.fileHandle.read(dest, { at: byteOffset });
+        if (bytesRead < byteLength) {
+          throw new Error(
+            `OpfsSourceBuffer.readRange: short read (${bytesRead}/${byteLength} bytes at offset ${byteOffset})`
+          );
+        }
+        return dest;
       }
-      return dest;
+
+      if (this.window === null) this.window = new Uint8Array(cap);
+      const end = byteOffset + byteLength;
+      const inWindow =
+        this.winLen > 0 &&
+        byteOffset >= this.winStart &&
+        end <= this.winStart + this.winLen;
+      if (!inWindow) {
+        // Fill so [byteOffset, end) is covered. When the window holds the whole
+        // file, anchor at 0 so reads below the first touched offset still hit.
+        const start = cap >= this.byteLength ? 0 : byteOffset;
+        const want = Math.min(cap, this.byteLength - start);
+        const got = this.fileHandle.read(this.window.subarray(0, want), {
+          at: start,
+        });
+        if (got < want) {
+          throw new Error(
+            `OpfsSourceBuffer.readRange: short window read (${got}/${want} bytes at offset ${start})`
+          );
+        }
+        this.winStart = start;
+        this.winLen = want;
+      }
+      // Copy out — callers retain returned slices across later reads (the next
+      // refill would overwrite a view into the shared window buffer).
+      const rel = byteOffset - this.winStart;
+      return this.window.slice(rel, rel + byteLength);
     }
 
     throw new Error('OpfsSourceBuffer: no backing store available');
@@ -211,5 +263,8 @@ export class OpfsSourceBuffer {
 
     this.asyncFileHandle = null;
     this.memoryBuffer = null;
+    this.window = null;
+    this.winStart = 0;
+    this.winLen = 0;
   }
 }
