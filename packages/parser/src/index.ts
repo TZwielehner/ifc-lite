@@ -116,6 +116,7 @@ import { PropertyExtractor } from './property-extractor.js';
 import { RelationshipExtractor } from './relationship-extractor.js';
 import { ColumnarParser, type IfcDataStore, type SourceReader } from './columnar-parser.js';
 import { OpfsSourceBuffer } from './opfs-source-buffer.js';
+import { scanEntitiesChunked } from './chunked-tokenizer.js';
 import { scanEntitiesInWorker } from './scan-worker-inline.js';
 import { buildEntityRefsFromIndex } from './entity-refs-from-index.js';
 import { safeUtf8Decode } from '@ifc-lite/data';
@@ -626,18 +627,54 @@ export async function parseAutoFromOpfsSource(
   source: OpfsSourceBuffer,
   options: ParseOptions = {},
 ): Promise<AutoParseResult> {
-  // One materialise — yields a Uint8Array view over a fresh ArrayBuffer
-  // when the source is OPFS-backed (1× input alloc). For in-memory
-  // sources `subarray` returns a zero-copy view; we then re-wrap into a
-  // fresh ArrayBuffer to keep the format-detect / parseColumnar contracts
-  // stable. The temporary buffer is reachable only via the local
-  // `materialised` reference, so V8 can reclaim it as soon as parseAuto
-  // returns.
-  // Materialize once for the scan + format detection — the WASM scanner and
-  // the byte-scan helpers need a contiguous buffer. For OPFS-backed sources
-  // `subarray` already returned a fresh, exactly-sized ArrayBuffer, so we pass
-  // it straight through (no second copy). Only the in-memory fallback (a view
-  // that may sit at a nonzero offset) needs a slice to detach the exact range.
+  // Detect the format from a small header read — never materialize the whole
+  // source just to sniff the first bytes. detectFormat needs an ArrayBuffer;
+  // read a small, exactly-sized header slice and hand its backing buffer over.
+  const headerLen = Math.min(source.byteLength, 64);
+  const headerView = source.subarray(0, headerLen);
+  const headerExact =
+    headerView.byteOffset === 0 &&
+    headerView.byteLength === headerView.buffer.byteLength;
+  const headerBuffer = (
+    headerExact
+      ? headerView.buffer
+      : headerView.buffer.slice(
+          headerView.byteOffset,
+          headerView.byteOffset + headerView.byteLength,
+        )
+  ) as ArrayBuffer;
+  const format = detectFormat(headerBuffer);
+
+  if (format === 'ifc') {
+    // Tier-2 streaming scan: read the source in windows through the
+    // SourceReader seam (a disk range read per window for OPFS) and build
+    // EntityRef[] without ever materializing the full N bytes into one
+    // contiguous heap buffer. The returned store also reads on-demand byte
+    // ranges through `source`, so a 2 GB file is never one flat buffer.
+    const entityRefs: EntityRef[] = [];
+    for (const e of scanEntitiesChunked(source)) {
+      entityRefs.push({
+        expressId: e.expressId,
+        type: e.type,
+        byteOffset: e.offset,
+        byteLength: e.length,
+        lineNumber: e.line,
+      });
+    }
+    // parseLite reads everything through `sourceReader`; the `buffer` arg is
+    // unused on that path, so pass an empty ArrayBuffer (no allocation of N
+    // bytes).
+    const data = await new ColumnarParser().parseLite(
+      new ArrayBuffer(0),
+      entityRefs,
+      { ...options, sourceReader: source },
+    );
+    return { format: 'ifc', data };
+  }
+
+  // IFCX (JSON) — out of scope for streaming; materialize once and delegate to
+  // the existing parseAuto path. `subarray` over an OPFS-backed source already
+  // returns a fresh, exactly-sized ArrayBuffer, so we pass it straight through.
   const materialised = source.subarray(0, source.byteLength);
   const exact =
     materialised.byteOffset === 0 &&
@@ -650,9 +687,5 @@ export async function parseAutoFromOpfsSource(
           materialised.byteOffset + materialised.byteLength,
         )
   ) as ArrayBuffer;
-  // Thread the OpfsSourceBuffer through as the store's retained source: the
-  // parse scans `buffer` transiently, but the returned store reads on-demand
-  // ranges from `source` (disk for OPFS), so the full N bytes are not pinned
-  // in the JS heap after this returns.
   return parseAuto(buffer, { ...options, sourceReader: source });
 }

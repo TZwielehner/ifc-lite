@@ -10,6 +10,7 @@
  */
 
 import type { EntityRef } from './types.js';
+import type { SourceReader } from './columnar-parser.js';
 import { EntityExtractor } from './entity-extractor.js';
 
 /**
@@ -55,12 +56,14 @@ const CONVERSION_BASED_UNIT_FACTORS: Record<string, number> = {
  * Follows the chain: IFCPROJECT → IFCUNITASSIGNMENT → IFCSIUNIT/IFCCONVERSIONBASEDUNIT
  * Returns the multiplier to convert coordinates to meters.
  *
- * @param source - Raw IFC file bytes
+ * @param source - Range-readable source (Uint8Array in-memory view or
+ *   OPFS-backed OpfsSourceBuffer). Unit entities are read per-entity via the
+ *   EntityExtractor seam (`subarray`), so no flat buffer is required.
  * @param entityIndex - Entity index with byId and byType maps
  * @returns Scale factor to apply to length values (e.g., 0.001 for millimeters)
  */
 export function extractLengthUnitScale(
-  source: Uint8Array,
+  source: SourceReader,
   entityIndex: { byId: { get(expressId: number): EntityRef | undefined }; byType: Map<string, number[]> }
 ): number {
   const extractor = new EntityExtractor(source);

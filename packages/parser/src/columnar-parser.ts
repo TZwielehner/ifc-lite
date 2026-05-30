@@ -180,7 +180,14 @@ export class ColumnarParser {
         } = {}
     ): Promise<IfcDataStore> {
         const startTime = performance.now();
-        const uint8Buffer = new Uint8Array(buffer);
+        // Read the source through the SourceReader seam. When the caller
+        // supplies an `sourceReader` (OPFS-backed), DO NOT materialize the
+        // whole `buffer` into a contiguous Uint8Array — that is the whole
+        // point of Tier-2: a 2 GB file must never be one flat heap buffer.
+        // For the in-memory path `src` is a real Uint8Array, so every
+        // `src.subarray(start, end)` below is a zero-copy view (O(1)) and the
+        // behavior is byte-identical to the previous flat-buffer indexing.
+        const src: SourceReader = options.sourceReader ?? new Uint8Array(buffer);
         const totalEntities = entityRefs.length;
 
         // Phase timing for performance telemetry
@@ -199,7 +206,7 @@ export class ColumnarParser {
         options.onProgress?.({ phase: 'building', percent: 0 });
 
         // Detect schema version from FILE_SCHEMA header
-        const schemaVersion = detectSchemaVersion(uint8Buffer);
+        const schemaVersion = detectSchemaVersion(src.subarray(0, Math.min(src.byteLength, 2000)));
 
         // Initialize builders (entity table capacity set after categorization below)
         const strings = new StringTable();
@@ -348,7 +355,7 @@ export class ColumnarParser {
         // missing from the compact index, making on-demand extraction fail.
         const associationTargetIds = new Set<number>();
         for (const ref of associationRelRefs) {
-            const result = extractPropertyRelFast(uint8Buffer, ref.byteOffset, ref.byteLength);
+            const result = extractPropertyRelFast(src.subarray(ref.byteOffset, ref.byteOffset + ref.byteLength), 0, ref.byteLength);
             if (result) associationTargetIds.add(result.relatingDef);
         }
 
@@ -405,7 +412,7 @@ export class ColumnarParser {
         // (instead of per-entity calls), and pure byte scanning for relationships.
         options.onProgress?.({ phase: 'parsing entities', percent: 10 });
 
-        const extractor = new EntityExtractor(uint8Buffer);
+        const extractor = new EntityExtractor(src);
 
         // Spatial entities: small count, use extractEntity for full accuracy
         const parsedEntityData = new Map<number, { globalId: string; name: string }>();
@@ -425,12 +432,12 @@ export class ColumnarParser {
 
         // Geometry + type object entities: batch extract GlobalId+Name with 2 TextDecoder calls
         options.onProgress?.({ phase: 'parsing geometry names', percent: 12 });
-        const geomData = await batchExtractGlobalIdAndName(uint8Buffer, geometryRefs, yieldIfNeeded);
+        const geomData = await batchExtractGlobalIdAndName(src, geometryRefs, yieldIfNeeded);
         for (const [id, data] of geomData) parsedEntityData.set(id, data);
 
         await yieldIfNeeded();
 
-        const typeData = await batchExtractGlobalIdAndName(uint8Buffer, typeObjectRefs, yieldIfNeeded);
+        const typeData = await batchExtractGlobalIdAndName(src, typeObjectRefs, yieldIfNeeded);
         for (const [id, data] of typeData) parsedEntityData.set(id, data);
         logPhase('batch geom GlobalId+Name');
 
@@ -443,7 +450,7 @@ export class ColumnarParser {
             if ((i & 0x3FF) === 0) await yieldIfNeeded();
             const ref = relationshipRefs[i];
             const typeUpper = getTypeUpper(ref.type);
-            const rel = extractRelFast(uint8Buffer, ref.byteOffset, ref.byteLength, typeUpper);
+            const rel = extractRelFast(src.subarray(ref.byteOffset, ref.byteOffset + ref.byteLength), 0, ref.byteLength, typeUpper);
             if (rel) {
                 const relType = REL_TYPE_MAP[typeUpper];
                 if (relType) {
@@ -501,7 +508,7 @@ export class ColumnarParser {
 
         // === EXTRACT LENGTH UNIT SCALE ===
         options.onProgress?.({ phase: 'extracting units', percent: 85 });
-        const lengthUnitScale = extractLengthUnitScale(uint8Buffer, entityIndex);
+        const lengthUnitScale = extractLengthUnitScale(src, entityIndex);
 
         // === BUILD SPATIAL HIERARCHY ===
         options.onProgress?.({ phase: 'building hierarchy', percent: 90 });
@@ -513,7 +520,7 @@ export class ColumnarParser {
                 entityTable,
                 hierarchyRelGraph,
                 strings,
-                uint8Buffer,
+                src,
                 entityIndex,
                 lengthUnitScale
             );
@@ -527,16 +534,17 @@ export class ColumnarParser {
         // parsing continues. This lets the panel appear at the same time as
         // geometry streaming completes.
         const earlyStore: IfcDataStore = {
-            fileSize: buffer.byteLength,
+            fileSize: src.byteLength,
             schemaVersion,
             entityCount: totalEntities,
             parseTime: performance.now() - startTime,
-            // Retain the range-readable source when the caller supplied one
-            // (OPFS-backed). The scan above used `uint8Buffer` (materialized
-            // for the WASM/byte-scan helpers); once this function returns it is
-            // unreferenced and freed, so the store no longer pins the full N
-            // bytes — on-demand extraction reads ranges from `sourceReader`.
-            source: options.sourceReader ?? uint8Buffer,
+            // `src` is the SourceReader seam: a real Uint8Array for the
+            // in-memory path (zero-copy `subarray` views) or an OPFS-backed
+            // OpfsSourceBuffer when the caller supplied `options.sourceReader`.
+            // In the OPFS case the full N bytes were never materialized into a
+            // contiguous heap buffer — on-demand extraction reads byte ranges
+            // (disk reads) through this same seam.
+            source: src,
             entityIndex,
             strings,
             entities: entityTable,
@@ -572,7 +580,7 @@ export class ColumnarParser {
         for (let pi = 0; pi < propertyRelRefs.length; pi++) {
             if ((pi & 0x3FF) === 0) await yieldIfNeeded();
             const ref = propertyRelRefs[pi];
-            const result = extractPropertyRelFast(uint8Buffer, ref.byteOffset, ref.byteLength);
+            const result = extractPropertyRelFast(src.subarray(ref.byteOffset, ref.byteOffset + ref.byteLength), 0, ref.byteLength);
             if (result) {
                 const { relatedObjects, relatingDef } = result;
                 totalPropRelObjects += relatedObjects.length;
@@ -607,7 +615,7 @@ export class ColumnarParser {
         for (let i = 0; i < associationRelRefs.length; i++) {
             if ((i & 0x3FF) === 0) await yieldIfNeeded();
             const ref = associationRelRefs[i];
-            const result = extractPropertyRelFast(uint8Buffer, ref.byteOffset, ref.byteLength);
+            const result = extractPropertyRelFast(src.subarray(ref.byteOffset, ref.byteOffset + ref.byteLength), 0, ref.byteLength);
             if (result) {
                 const { relatedObjects, relatingDef: relatingRef } = result;
                 const typeUpper = getTypeUpper(ref.type);

@@ -10,6 +10,7 @@
  */
 
 import type { EntityRef } from './types.js';
+import type { SourceReader } from './columnar-parser.js';
 import { decodeIfcString } from '@ifc-lite/encoding';
 
 /**
@@ -150,13 +151,23 @@ export function readRefList(buffer: Uint8Array, pos: number, end: number): [numb
  * Returns a Map from expressId → { globalId, name }.
  */
 export async function batchExtractGlobalIdAndName(
-    buffer: Uint8Array,
+    source: SourceReader,
     refs: EntityRef[],
     yieldIfNeeded?: () => Promise<void>,
 ): Promise<Map<number, { globalId: string; name: string }>> {
     const result = new Map<number, { globalId: string; name: string }>();
     if (refs.length === 0) return result;
     const CHUNK_SIZE = 2048;
+
+    // Fast path: a real, contiguous Uint8Array (the in-memory parse path).
+    // Keeps the original 2-TextDecoder-calls-for-all-entities optimization —
+    // byte ranges are scanned in the flat buffer and concatenated once. For a
+    // non-Uint8Array SourceReader (OPFS-backed) we cannot cheaply address a
+    // single flat buffer, so fall through to the per-entity path below.
+    if (!(source instanceof Uint8Array)) {
+        return batchExtractGlobalIdAndNamePerEntity(source, refs, yieldIfNeeded);
+    }
+    const buffer = source;
 
     // Phase 1: Scan byte ranges for GlobalId and Name positions (no string allocation)
     const gidRanges: Array<[number, number]> = []; // [start, end) for each entity
@@ -233,6 +244,54 @@ export async function batchExtractGlobalIdAndName(
             globalId: gids[i] || '',
             name: rawName ? decodeIfcString(rawName) : '',
         });
+    }
+
+    return result;
+}
+
+/**
+ * Per-entity GlobalId+Name extraction for a non-Uint8Array `SourceReader`
+ * (e.g. OPFS-backed). Reads each entity's bytes via `source.subarray` and
+ * decodes them locally. This forgoes the 2-TextDecoder batched-decode
+ * optimization of the contiguous fast path (it cannot address one flat
+ * buffer), but produces BYTE-IDENTICAL results: the same `findQuotedAttrRange`
+ * byte scan, the same raw (undecoded) GlobalId, and the same `decodeIfcString`
+ * applied to the Name. Output is therefore indistinguishable from the
+ * in-memory path for any source addressing the same bytes.
+ */
+async function batchExtractGlobalIdAndNamePerEntity(
+    source: SourceReader,
+    refs: EntityRef[],
+    yieldIfNeeded?: () => Promise<void>,
+): Promise<Map<number, { globalId: string; name: string }>> {
+    const result = new Map<number, { globalId: string; name: string }>();
+    const CHUNK_SIZE = 2048;
+    const decoder = new TextDecoder();
+
+    for (let i = 0; i < refs.length; i++) {
+        if (yieldIfNeeded && (i & (CHUNK_SIZE - 1)) === 0) {
+            await yieldIfNeeded();
+        }
+        const ref = refs[i];
+        // Read this entity's bytes once at local offset 0. The quoted-attr
+        // ranges returned by `findQuotedAttrRange` are then relative to this
+        // slice, so they index `bytes` directly.
+        const bytes = source.subarray(ref.byteOffset, ref.byteOffset + ref.byteLength);
+        const gidRange = findQuotedAttrRange(bytes, 0, ref.byteLength, 0);
+        const nameRange = findQuotedAttrRange(bytes, 0, ref.byteLength, 2);
+
+        let globalId = '';
+        if (gidRange && gidRange[1] > gidRange[0]) {
+            globalId = decoder.decode(bytes.subarray(gidRange[0], gidRange[1]));
+        }
+
+        let name = '';
+        if (nameRange && nameRange[1] > nameRange[0]) {
+            const rawName = decoder.decode(bytes.subarray(nameRange[0], nameRange[1]));
+            name = rawName ? decodeIfcString(rawName) : '';
+        }
+
+        result.set(ref.expressId, { globalId, name });
     }
 
     return result;
