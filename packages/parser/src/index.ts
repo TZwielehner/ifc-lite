@@ -155,6 +155,14 @@ export interface ParseOptions {
    * reads byte ranges from here. Must address the same bytes as `buffer`.
    */
   sourceReader?: SourceReader;
+  /**
+   * Index-only parse: build just the entity index (byId + byType) and return,
+   * skipping the spatial hierarchy, relationship graph, table population, and
+   * on-demand maps. For consumers that only walk raw entity bytes by id/type
+   * (the fix pipeline). The returned strings/entities/properties/quantities/
+   * relationships are valid but EMPTY. See `parseLite`'s `indexOnly`.
+   */
+  indexOnly?: boolean;
 }
 
 /**
@@ -624,7 +632,7 @@ export async function parseAuto(
  *     parse never holds the full buffer is the remaining follow-up.)
  */
 export async function parseAutoFromOpfsSource(
-  source: OpfsSourceBuffer,
+  source: SourceReader,
   options: ParseOptions = {},
 ): Promise<AutoParseResult> {
   // Detect the format from a small header read — never materialize the whole

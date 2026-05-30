@@ -177,6 +177,18 @@ export class ColumnarParser {
              * Must address the same bytes as `buffer`.
              */
             sourceReader?: SourceReader;
+            /**
+             * Index-only parse: build just the entity index (byId + byType) over
+             * the range-readable source and return immediately — skip the spatial
+             * hierarchy, the relationship graph, the entity/property/quantity table
+             * population, and the on-demand maps. Consumers that only walk raw
+             * entity bytes by id/type (the fix pipeline: it touches just
+             * entityIndex + source + schemaVersion) get a store whose heap is the
+             * compact index alone instead of the full semantic graph (~20x → ~1x
+             * on large files). The returned strings/entities/properties/quantities/
+             * relationships are valid but EMPTY — do not use them in this mode.
+             */
+            indexOnly?: boolean;
         } = {}
     ): Promise<IfcDataStore> {
         const startTime = performance.now();
@@ -406,6 +418,28 @@ export class ColumnarParser {
             byId: compactByIdIndex as EntityByIdIndex,
             byType,
         };
+
+        if (options.indexOnly) {
+            // Fix-pipeline fast path: the entity index is built; everything below
+            // (entity/property/quantity tables, spatial hierarchy, relationship
+            // graph, on-demand maps) is the semantic graph the fixer never reads.
+            // Return now with valid-but-empty tables so the resident heap is the
+            // compact index alone, not the full graph.
+            logPhase('index-only early return (graph build skipped)');
+            return {
+                fileSize: src.byteLength,
+                schemaVersion,
+                entityCount: totalEntities,
+                parseTime: performance.now() - startTime,
+                source: src,
+                entityIndex,
+                strings,
+                entities: entityTableBuilder.build(),
+                properties: propertyTableBuilder.build(),
+                quantities: quantityTableBuilder.build(),
+                relationships: relationshipGraphBuilder.build(),
+            };
+        }
 
         // === TARGETED PARSING using batch byte-level extraction ===
         // Uses 2 TextDecoder.decode() calls total for ALL entity GlobalIds/Names
