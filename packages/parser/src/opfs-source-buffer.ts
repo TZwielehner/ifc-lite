@@ -285,6 +285,34 @@ export class OpfsSourceBuffer {
   }
 
   /**
+   * Window-aligned access for the WASM kernels: position the window to cover
+   * [start, …) and return the contiguous slab (a view into the window buffer) +
+   * its coverage, so a kernel reads entities at window-relative offsets straight
+   * from it — no separate packed batch. Bounded: ≤ one window in wasm memory.
+   * In-memory sources return their whole buffer. Anchors at `start` (not 0) so
+   * the caller can sweep the file window-by-window.
+   */
+  fillWindow(start: number): { buf: Uint8Array; start: number; len: number } {
+    if (this.memoryBuffer) {
+      return { buf: this.memoryBuffer, start: 0, len: this.byteLength };
+    }
+    if (!this.fileHandle) {
+      throw new Error("OpfsSourceBuffer.fillWindow: no backing store");
+    }
+    const cap = Math.min(
+      OpfsSourceBuffer.windowBytes,
+      Math.max(this.byteLength, 1)
+    );
+    if (this.window === null) this.window = new Uint8Array(cap);
+    const s = Math.max(0, Math.min(start, this.byteLength));
+    const want = Math.min(cap, this.byteLength - s);
+    const got = this.fileHandle.read(this.window.subarray(0, want), { at: s });
+    this.winStart = s;
+    this.winLen = got;
+    return { buf: this.window.subarray(0, got), start: s, len: got };
+  }
+
+  /**
    * Get the full in-memory buffer (only available when not OPFS-backed).
    * Used as a migration aid — callers should prefer readRange().
    *

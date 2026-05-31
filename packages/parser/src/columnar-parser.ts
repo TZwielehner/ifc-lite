@@ -68,6 +68,12 @@ export interface SourceReader {
      * WASM kernels) reuse an existing buffer instead of re-materializing.
      */
     wholeBuffer?(): Uint8Array | null;
+    /**
+     * Optional: position the read-window to cover [start, …) and return the
+     * contiguous slab (a view into the window) + its coverage, for window-aligned
+     * kernel sweeps over a >window source without a separate packed batch.
+     */
+    fillWindow?(start: number): { buf: Uint8Array; start: number; len: number };
 }
 
 export interface IfcDataStore {
