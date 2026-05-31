@@ -121,3 +121,97 @@ describe('OpfsSourceBuffer windowed OPFS reads', () => {
     );
   });
 });
+
+describe('OpfsSourceBuffer.fromOpfsFile', () => {
+  // Stub navigator.storage with an in-memory OPFS so fromOpfsFile's
+  // getDirectory → getDirectoryHandle → getFileHandle → createSyncAccessHandle
+  // chain resolves in Node.
+  function installFakeOpfs(files: Record<string, Uint8Array>) {
+    const removed: string[] = [];
+    const closed = { count: 0 };
+    const makeHandle = (data: Uint8Array) => ({
+      read(buffer: ArrayBufferView, options?: { at?: number }): number {
+        const at = options?.at ?? 0;
+        const dest = new Uint8Array(
+          buffer.buffer,
+          buffer.byteOffset,
+          buffer.byteLength
+        );
+        const n = Math.max(0, Math.min(dest.length, data.length - at));
+        dest.set(data.subarray(at, at + n));
+        return n;
+      },
+      write: () => 0,
+      getSize: () => data.length,
+      flush: () => {},
+      close: () => {
+        closed.count++;
+      },
+    });
+    const dir: Record<string, unknown> = {
+      getFileHandle: async (name: string, opts?: { create?: boolean }) => {
+        if (!(name in files) && !opts?.create) {
+          throw new Error(`NotFoundError: ${name}`);
+        }
+        return { createSyncAccessHandle: async () => makeHandle(files[name]) };
+      },
+      getDirectoryHandle: async () => dir,
+      removeEntry: async (name: string) => {
+        removed.push(name);
+      },
+    };
+    // navigator is a getter-only global in Node/vitest — define it instead of
+    // assigning, and capture the original descriptor to restore.
+    const prevDesc = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+    Object.defineProperty(globalThis, 'navigator', {
+      value: { storage: { getDirectory: async () => dir } },
+      configurable: true,
+      writable: true,
+    });
+    return {
+      removed,
+      closed,
+      restore: () => {
+        if (prevDesc) Object.defineProperty(globalThis, 'navigator', prevDesc);
+        else delete (globalThis as { navigator?: unknown }).navigator;
+      },
+    };
+  }
+
+  it('opens an existing file, reads correct bytes, and dispose() does NOT delete it', async () => {
+    const data = makeData(3000);
+    const fake = installFakeOpfs({ 'iter-3.bin': data });
+    try {
+      const src = await OpfsSourceBuffer.fromOpfsFile('iter-3.bin');
+      expect(src.byteLength).toBe(3000);
+      expect(Array.from(src.readRange(100, 50))).toEqual(
+        Array.from(data.subarray(100, 150))
+      );
+      await src.dispose();
+      // dispose closes the read handle but must NOT removeEntry the file:
+      // the sink that wrote it owns deletion.
+      expect(fake.closed.count).toBe(1);
+      expect(fake.removed).toEqual([]);
+    } finally {
+      fake.restore();
+    }
+  });
+
+  it('resolves a file inside a named subdirectory', async () => {
+    const data = makeData(512);
+    const fake = installFakeOpfs({ 'iter-0.bin': data });
+    try {
+      const src = await OpfsSourceBuffer.fromOpfsFile(
+        'iter-0.bin',
+        'ifc-check-recfix'
+      );
+      expect(src.byteLength).toBe(512);
+      expect(Array.from(src.readRange(0, 16))).toEqual(
+        Array.from(data.subarray(0, 16))
+      );
+      await src.dispose();
+    } finally {
+      fake.restore();
+    }
+  });
+});

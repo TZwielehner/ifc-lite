@@ -18,6 +18,7 @@
 interface OpfsSyncAccessHandle {
   read(buffer: ArrayBufferView, options?: { at?: number }): number;
   write(buffer: ArrayBufferView, options?: { at?: number }): number;
+  getSize(): number;
   flush(): void;
   close(): void;
 }
@@ -131,6 +132,40 @@ export class OpfsSourceBuffer {
       }
       return new OpfsSourceBuffer(buffer, buffer.byteLength, false);
     }
+  }
+
+  /**
+   * Open an EXISTING OPFS file as a disk-backed source — no write, no
+   * materialize. The streaming convergence handoff: one iteration's sink file
+   * becomes the next iteration's source directly, avoiding a whole-file
+   * arrayBuffer() round-trip (which would also exceed V8's ~2 GiB ArrayBuffer
+   * cap on a 2 GB file). NON-OWNING: dispose() closes the read handle but does
+   * NOT delete the file — whoever wrote it (the sink) owns its lifetime.
+   *
+   * @param fileName - OPFS file name to open (must already exist)
+   * @param dirName - optional OPFS subdirectory the file lives in (root if omitted)
+   */
+  static async fromOpfsFile(
+    fileName: string,
+    dirName?: string
+  ): Promise<OpfsSourceBuffer> {
+    if (!OpfsSourceBuffer.isOpfsAvailable()) {
+      throw new Error('OpfsSourceBuffer.fromOpfsFile: OPFS unavailable');
+    }
+    const root = await navigator.storage.getDirectory();
+    const dir = dirName ? await root.getDirectoryHandle(dirName) : root;
+    // No { create } — the file must already exist (it's the prior iter's sink).
+    const fileHandle = (await dir.getFileHandle(
+      fileName
+    )) as unknown as OpfsFileHandle;
+    const syncHandle = await fileHandle.createSyncAccessHandle();
+    const byteLength = syncHandle.getSize();
+    const instance = new OpfsSourceBuffer(null, byteLength, true);
+    instance.fileHandle = syncHandle;
+    instance.asyncFileHandle = fileHandle;
+    // opfsFileName stays null → dispose() closes the handle but never
+    // removeEntry()s the file: the sink that wrote it owns deletion.
+    return instance;
   }
 
   /**
