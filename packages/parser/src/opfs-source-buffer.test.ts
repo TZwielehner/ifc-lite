@@ -215,3 +215,60 @@ describe('OpfsSourceBuffer.fromOpfsFile', () => {
     }
   });
 });
+
+describe('OpfsSourceBuffer.wholeBuffer', () => {
+  const orig = OpfsSourceBuffer.windowBytes;
+  afterEach(() => {
+    OpfsSourceBuffer.windowBytes = orig;
+  });
+
+  function opfsBacked(data: Uint8Array): OpfsSourceBuffer {
+    const handle = {
+      read(buffer: ArrayBufferView, options?: { at?: number }): number {
+        const at = options?.at ?? 0;
+        const dest = new Uint8Array(
+          buffer.buffer,
+          buffer.byteOffset,
+          buffer.byteLength
+        );
+        const n = Math.max(0, Math.min(dest.length, data.length - at));
+        dest.set(data.subarray(at, at + n));
+        return n;
+      },
+      write: () => 0,
+      getSize: () => data.length,
+      flush: () => {},
+      close: () => {},
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const buf = new (OpfsSourceBuffer as any)(null, data.length, true);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (buf as any).fileHandle = handle;
+    return buf;
+  }
+  const mk = (n: number): Uint8Array => {
+    const d = new Uint8Array(n);
+    for (let i = 0; i < n; i++) d[i] = (i * 31 + 7) & 0xff;
+    return d;
+  };
+
+  it('returns the whole file when it fits the window', () => {
+    OpfsSourceBuffer.windowBytes = 1024 * 1024;
+    const data = mk(2048);
+    const whole = opfsBacked(data).wholeBuffer();
+    expect(whole).not.toBeNull();
+    expect(Array.from(whole!)).toEqual(Array.from(data));
+  });
+
+  it('returns null when the file exceeds the window', () => {
+    OpfsSourceBuffer.windowBytes = 1024;
+    expect(opfsBacked(mk(4096)).wholeBuffer()).toBeNull();
+  });
+
+  it('in-memory source returns its buffer directly', () => {
+    const data = mk(512);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const buf = new (OpfsSourceBuffer as any)(data, data.length, false);
+    expect(buf.wholeBuffer()).toBe(data);
+  });
+});

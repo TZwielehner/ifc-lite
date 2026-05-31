@@ -60,6 +60,14 @@ export type { SpatialIndex, EntityByIdIndex } from './columnar-parser-indexes.js
 export interface SourceReader {
     readonly byteLength: number;
     subarray(start: number, end: number): Uint8Array;
+    /**
+     * Optional: the whole source as one contiguous Uint8Array when it can be
+     * served cheaply (already in memory, or a disk-backed reader whose window
+     * holds the whole file). Returns null when not available (e.g. a file larger
+     * than the read-window). Lets consumers that need a contiguous &[u8] (the
+     * WASM kernels) reuse an existing buffer instead of re-materializing.
+     */
+    wholeBuffer?(): Uint8Array | null;
 }
 
 export interface IfcDataStore {

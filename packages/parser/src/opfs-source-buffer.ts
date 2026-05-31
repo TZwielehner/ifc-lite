@@ -257,6 +257,34 @@ export class OpfsSourceBuffer {
   }
 
   /**
+   * The whole file as one contiguous Uint8Array IFF it fits the read-window — so
+   * consumers that need a contiguous buffer (the WASM fix kernels) can run on a
+   * disk-backed source without a second materialize, reusing the window we
+   * already hold. Returns null for files larger than the window; those stay on
+   * the bounded/streaming path. In-memory sources return their buffer directly.
+   * Fills the window from disk on demand.
+   */
+  wholeBuffer(): Uint8Array | null {
+    if (this.memoryBuffer) return this.memoryBuffer;
+    if (!this.fileHandle) return null;
+    const cap = Math.min(
+      OpfsSourceBuffer.windowBytes,
+      Math.max(this.byteLength, 1)
+    );
+    if (cap < this.byteLength) return null; // exceeds window
+    if (this.window === null) this.window = new Uint8Array(cap);
+    if (this.winStart !== 0 || this.winLen < this.byteLength) {
+      const got = this.fileHandle.read(this.window.subarray(0, this.byteLength), {
+        at: 0,
+      });
+      if (got < this.byteLength) return null;
+      this.winStart = 0;
+      this.winLen = this.byteLength;
+    }
+    return this.window.subarray(0, this.byteLength);
+  }
+
+  /**
    * Get the full in-memory buffer (only available when not OPFS-backed).
    * Used as a migration aid — callers should prefer readRange().
    *
