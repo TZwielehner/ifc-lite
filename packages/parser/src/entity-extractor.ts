@@ -9,6 +9,7 @@
 import { createLogger } from '@ifc-lite/data';
 import { decodeIfcString } from '@ifc-lite/encoding';
 import type { IfcEntity, EntityRef } from './types.js';
+import type { SourceReader } from './columnar-parser.js';
 import { safeUtf8Decode } from '@ifc-lite/data';
 
 export type { IfcEntity };
@@ -19,10 +20,14 @@ const log = createLogger('EntityExtractor');
 const MAX_PARSE_DEPTH = 100;
 
 export class EntityExtractor {
-  private buffer: Uint8Array;
+  private source: SourceReader;
 
-  constructor(buffer: Uint8Array) {
-    this.buffer = buffer;
+  // Accepts any range-readable source: a plain Uint8Array (zero-copy views)
+  // or an OpfsSourceBuffer (disk-backed range reads). Uint8Array still
+  // satisfies SourceReader, so existing `new EntityExtractor(uint8array)`
+  // callers are unaffected.
+  constructor(source: SourceReader) {
+    this.source = source;
   }
 
   /**
@@ -30,11 +35,14 @@ export class EntityExtractor {
    */
   extractEntity(ref: EntityRef): IfcEntity | null {
     try {
-      const entityText = safeUtf8Decode(
-        this.buffer,
+      // Read just this entity's bytes through the source seam — a zero-copy
+      // subarray for in-memory sources, a disk range read for OPFS-backed
+      // ones — then decode the whole returned slice.
+      const bytes = this.source.subarray(
         ref.byteOffset,
         ref.byteOffset + ref.byteLength,
       );
+      const entityText = safeUtf8Decode(bytes, 0, bytes.byteLength);
 
       // Parse: #ID = TYPE(attr1, attr2, ...)
       const match = entityText.match(/^#(\d+)\s*=\s*(\w+)\((.*)\)/);

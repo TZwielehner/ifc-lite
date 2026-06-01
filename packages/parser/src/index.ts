@@ -18,7 +18,7 @@ export { RelationshipExtractor } from './relationship-extractor.js';
 export { StyleExtractor } from './style-extractor.js';
 export { SpatialHierarchyBuilder } from './spatial-hierarchy-builder.js';
 export { extractLengthUnitScale } from './unit-extractor.js';
-export { ColumnarParser, type IfcDataStore, type EntityByIdIndex, extractPropertiesOnDemand, extractQuantitiesOnDemand, extractEntityAttributesOnDemand, extractAllEntityAttributes, extractClassificationsOnDemand, extractMaterialsOnDemand, extractTypePropertiesOnDemand, extractTypeEntityOwnProperties, extractDocumentsOnDemand, extractRelationshipsOnDemand, extractGeoreferencingOnDemand, type ClassificationInfo, type MaterialInfo, type MaterialLayerInfo, type MaterialProfileInfo, type MaterialConstituentInfo, type TypePropertyInfo, type DocumentInfo, type EntityRelationships } from './columnar-parser.js';
+export { ColumnarParser, type IfcDataStore, type SourceReader, type EntityByIdIndex, extractPropertiesOnDemand, extractQuantitiesOnDemand, extractEntityAttributesOnDemand, extractAllEntityAttributes, extractClassificationsOnDemand, extractMaterialsOnDemand, extractTypePropertiesOnDemand, extractTypeEntityOwnProperties, extractDocumentsOnDemand, extractRelationshipsOnDemand, extractGeoreferencingOnDemand, type ClassificationInfo, type MaterialInfo, type MaterialLayerInfo, type MaterialProfileInfo, type MaterialConstituentInfo, type TypePropertyInfo, type DocumentInfo, type EntityRelationships } from './columnar-parser.js';
 // WorkerParser is browser-only due to Vite worker imports
 // Import from '@ifc-lite/parser/browser' instead
 
@@ -114,7 +114,9 @@ import { EntityIndexBuilder } from './entity-index.js';
 import { EntityExtractor } from './entity-extractor.js';
 import { PropertyExtractor } from './property-extractor.js';
 import { RelationshipExtractor } from './relationship-extractor.js';
-import { ColumnarParser, type IfcDataStore } from './columnar-parser.js';
+import { ColumnarParser, type IfcDataStore, type SourceReader } from './columnar-parser.js';
+import { OpfsSourceBuffer } from './opfs-source-buffer.js';
+import { scanEntitiesChunked } from './chunked-tokenizer.js';
 import { scanEntitiesInWorker } from './scan-worker-inline.js';
 import { buildEntityRefsFromIndex } from './entity-refs-from-index.js';
 import { safeUtf8Decode } from '@ifc-lite/data';
@@ -145,6 +147,22 @@ export interface ParseOptions {
     starts: Uint32Array;
     lengths: Uint32Array;
   };
+  /**
+   * Range-readable source to retain as `store.source` instead of the
+   * materialized scan buffer. When set (e.g. by `parseAutoFromOpfsSource`
+   * with an OPFS-backed `OpfsSourceBuffer`), the contiguous `buffer` is used
+   * only for the scan and is freed afterwards; on-demand extraction then
+   * reads byte ranges from here. Must address the same bytes as `buffer`.
+   */
+  sourceReader?: SourceReader;
+  /**
+   * Index-only parse: build just the entity index (byId + byType) and return,
+   * skipping the spatial hierarchy, relationship graph, table population, and
+   * on-demand maps. For consumers that only walk raw entity bytes by id/type
+   * (the fix pipeline). The returned strings/entities/properties/quantities/
+   * relationships are valid but EMPTY. See `parseLite`'s `indexOnly`.
+   */
+  indexOnly?: boolean;
 }
 
 /**
@@ -590,4 +608,92 @@ export async function parseAuto(
   }
 
   throw new Error('Unknown file format. Expected IFC (STEP) or IFCX (JSON).');
+}
+
+/**
+ * Parse an IFC/IFCX source that lives in OPFS (or in-memory fallback).
+ *
+ * Why this exists: large IFCs (≥ ~500 MiB) hit per-tab ArrayBuffer caps
+ * in the browser when held as a single transferred buffer. `OpfsSourceBuffer`
+ * lets the caller stage the source on disk first and only keep a handle in
+ * memory. This entry point is the bridge — callers don't have to know about
+ * the underlying storage.
+ *
+ * Memory model:
+ *   - The scan pass still materializes the source once into a contiguous
+ *     buffer (read from OPFS for OPFS-backed sources) — the WASM scanner and
+ *     the `extractRelFast` / `extractPropertyRelFast` byte-scan helpers need a
+ *     flat `Uint8Array`. That buffer is transient.
+ *   - The returned store retains the `OpfsSourceBuffer` as `store.source`
+ *     (threaded via `ParseOptions.sourceReader`), so once this returns the
+ *     transient scan buffer is unreferenced and freed, and all on-demand
+ *     extraction reads byte RANGES from disk — the parser never pins the full
+ *     N bytes in the JS heap after the scan. (Chunking the scan itself so even
+ *     parse never holds the full buffer is the remaining follow-up.)
+ */
+export async function parseAutoFromOpfsSource(
+  source: SourceReader,
+  options: ParseOptions = {},
+): Promise<AutoParseResult> {
+  // Detect the format from a small header read — never materialize the whole
+  // source just to sniff the first bytes. detectFormat needs an ArrayBuffer;
+  // read a small, exactly-sized header slice and hand its backing buffer over.
+  const headerLen = Math.min(source.byteLength, 64);
+  const headerView = source.subarray(0, headerLen);
+  const headerExact =
+    headerView.byteOffset === 0 &&
+    headerView.byteLength === headerView.buffer.byteLength;
+  const headerBuffer = (
+    headerExact
+      ? headerView.buffer
+      : headerView.buffer.slice(
+          headerView.byteOffset,
+          headerView.byteOffset + headerView.byteLength,
+        )
+  ) as ArrayBuffer;
+  const format = detectFormat(headerBuffer);
+
+  if (format === 'ifc') {
+    // Tier-2 streaming scan: read the source in windows through the
+    // SourceReader seam (a disk range read per window for OPFS) and build
+    // EntityRef[] without ever materializing the full N bytes into one
+    // contiguous heap buffer. The returned store also reads on-demand byte
+    // ranges through `source`, so a 2 GB file is never one flat buffer.
+    const entityRefs: EntityRef[] = [];
+    for (const e of scanEntitiesChunked(source)) {
+      entityRefs.push({
+        expressId: e.expressId,
+        type: e.type,
+        byteOffset: e.offset,
+        byteLength: e.length,
+        lineNumber: e.line,
+      });
+    }
+    // parseLite reads everything through `sourceReader`; the `buffer` arg is
+    // unused on that path, so pass an empty ArrayBuffer (no allocation of N
+    // bytes).
+    const data = await new ColumnarParser().parseLite(
+      new ArrayBuffer(0),
+      entityRefs,
+      { ...options, sourceReader: source },
+    );
+    return { format: 'ifc', data };
+  }
+
+  // IFCX (JSON) — out of scope for streaming; materialize once and delegate to
+  // the existing parseAuto path. `subarray` over an OPFS-backed source already
+  // returns a fresh, exactly-sized ArrayBuffer, so we pass it straight through.
+  const materialised = source.subarray(0, source.byteLength);
+  const exact =
+    materialised.byteOffset === 0 &&
+    materialised.byteLength === materialised.buffer.byteLength;
+  const buffer = (
+    exact
+      ? materialised.buffer
+      : materialised.buffer.slice(
+          materialised.byteOffset,
+          materialised.byteOffset + materialised.byteLength,
+        )
+  ) as ArrayBuffer;
+  return parseAuto(buffer, { ...options, sourceReader: source });
 }

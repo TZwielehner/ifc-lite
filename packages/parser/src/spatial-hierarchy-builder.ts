@@ -16,6 +16,7 @@ import {
   isStoreyLikeSpatialType,
 } from '@ifc-lite/data';
 import type { EntityRef } from './types.js';
+import type { SourceReader } from './columnar-parser.js';
 import { EntityExtractor } from './entity-extractor.js';
 
 const log = createLogger('SpatialHierarchy');
@@ -30,7 +31,7 @@ export class SpatialHierarchyBuilder {
     entities: EntityTable,
     relationships: RelationshipGraph,
     strings: StringTable,
-    source: Uint8Array,
+    source: SourceReader,
     entityIndex: { byId: { get(expressId: number): EntityRef | undefined } },
     lengthUnitScale: number = 1.0
   ): SpatialHierarchy {
@@ -162,7 +163,7 @@ export class SpatialHierarchyBuilder {
     entities: EntityTable,
     relationships: RelationshipGraph,
     strings: StringTable,
-    source: Uint8Array,
+    source: SourceReader,
     entityIndex: { byId: { get(expressId: number): EntityRef | undefined } },
     byStorey: Map<number, number[]>,
     byBuilding: Map<number, number[]>,
@@ -264,7 +265,7 @@ export class SpatialHierarchyBuilder {
    */
   private extractElevation(
     expressId: number,
-    source: Uint8Array,
+    source: SourceReader,
     entityIndex: { byId: { get(expressId: number): EntityRef | undefined } }
   ): number | undefined {
     const ref = entityIndex.byId.get(expressId);

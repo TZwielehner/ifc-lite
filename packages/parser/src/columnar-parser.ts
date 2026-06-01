@@ -48,13 +48,41 @@ import type { SpatialIndex, EntityByIdIndex } from './columnar-parser-indexes.js
 // Re-export interfaces/types from extracted modules for public API compatibility
 export type { SpatialIndex, EntityByIdIndex } from './columnar-parser-indexes.js';
 
+/**
+ * Range-readable view over the source bytes. Satisfied structurally by both a
+ * plain `Uint8Array` (in-memory path) and `OpfsSourceBuffer` (OPFS/disk-backed
+ * path) — `Uint8Array.subarray`'s optional params are assignable to the
+ * required ones here, and both expose `byteLength`. The store holds the source
+ * through this seam so on-demand extraction reads byte ranges (zero-copy view
+ * in memory, or a disk read for OPFS) without the parser ever pinning the full
+ * N bytes in the JS heap after the scan. See opfs-source-buffer.ts.
+ */
+export interface SourceReader {
+    readonly byteLength: number;
+    subarray(start: number, end: number): Uint8Array;
+    /**
+     * Optional: the whole source as one contiguous Uint8Array when it can be
+     * served cheaply (already in memory, or a disk-backed reader whose window
+     * holds the whole file). Returns null when not available (e.g. a file larger
+     * than the read-window). Lets consumers that need a contiguous &[u8] (the
+     * WASM kernels) reuse an existing buffer instead of re-materializing.
+     */
+    wholeBuffer?(): Uint8Array | null;
+    /**
+     * Optional: position the read-window to cover [start, …) and return the
+     * contiguous slab (a view into the window) + its coverage, for window-aligned
+     * kernel sweeps over a >window source without a separate packed batch.
+     */
+    fillWindow?(start: number): { buf: Uint8Array; start: number; len: number };
+}
+
 export interface IfcDataStore {
     fileSize: number;
     schemaVersion: 'IFC2X3' | 'IFC4' | 'IFC4X3' | 'IFC5';
     entityCount: number;
     parseTime: number;
 
-    source: Uint8Array;
+    source: SourceReader;
     entityIndex: { byId: EntityByIdIndex; byType: Map<string, number[]> };
     deferredEntityIndex?: EntityByIdIndex;
 
@@ -154,10 +182,38 @@ export class ColumnarParser {
             yieldIntervalMs?: number;
             deferPropertyAtomIndex?: boolean;
             onSpatialReady?: (partialStore: IfcDataStore) => void;
+            /**
+             * When set, the returned store retains THIS as `store.source` (a
+             * range-readable OpfsSourceBuffer) instead of the materialized scan
+             * buffer. The scan still runs over the contiguous `buffer` arg, but
+             * once parsing returns, that buffer is unreferenced and freed, and
+             * on-demand extraction reads byte ranges from here (disk for OPFS).
+             * Must address the same bytes as `buffer`.
+             */
+            sourceReader?: SourceReader;
+            /**
+             * Index-only parse: build just the entity index (byId + byType) over
+             * the range-readable source and return immediately — skip the spatial
+             * hierarchy, the relationship graph, the entity/property/quantity table
+             * population, and the on-demand maps. Consumers that only walk raw
+             * entity bytes by id/type (the fix pipeline: it touches just
+             * entityIndex + source + schemaVersion) get a store whose heap is the
+             * compact index alone instead of the full semantic graph (~20x → ~1x
+             * on large files). The returned strings/entities/properties/quantities/
+             * relationships are valid but EMPTY — do not use them in this mode.
+             */
+            indexOnly?: boolean;
         } = {}
     ): Promise<IfcDataStore> {
         const startTime = performance.now();
-        const uint8Buffer = new Uint8Array(buffer);
+        // Read the source through the SourceReader seam. When the caller
+        // supplies an `sourceReader` (OPFS-backed), DO NOT materialize the
+        // whole `buffer` into a contiguous Uint8Array — that is the whole
+        // point of Tier-2: a 2 GB file must never be one flat heap buffer.
+        // For the in-memory path `src` is a real Uint8Array, so every
+        // `src.subarray(start, end)` below is a zero-copy view (O(1)) and the
+        // behavior is byte-identical to the previous flat-buffer indexing.
+        const src: SourceReader = options.sourceReader ?? new Uint8Array(buffer);
         const totalEntities = entityRefs.length;
 
         // Phase timing for performance telemetry
@@ -176,7 +232,7 @@ export class ColumnarParser {
         options.onProgress?.({ phase: 'building', percent: 0 });
 
         // Detect schema version from FILE_SCHEMA header
-        const schemaVersion = detectSchemaVersion(uint8Buffer);
+        const schemaVersion = detectSchemaVersion(src.subarray(0, Math.min(src.byteLength, 2000)));
 
         // Initialize builders (entity table capacity set after categorization below)
         const strings = new StringTable();
@@ -325,7 +381,7 @@ export class ColumnarParser {
         // missing from the compact index, making on-demand extraction fail.
         const associationTargetIds = new Set<number>();
         for (const ref of associationRelRefs) {
-            const result = extractPropertyRelFast(uint8Buffer, ref.byteOffset, ref.byteLength);
+            const result = extractPropertyRelFast(src.subarray(ref.byteOffset, ref.byteOffset + ref.byteLength), 0, ref.byteLength);
             if (result) associationTargetIds.add(result.relatingDef);
         }
 
@@ -377,12 +433,34 @@ export class ColumnarParser {
             byType,
         };
 
+        if (options.indexOnly) {
+            // Fix-pipeline fast path: the entity index is built; everything below
+            // (entity/property/quantity tables, spatial hierarchy, relationship
+            // graph, on-demand maps) is the semantic graph the fixer never reads.
+            // Return now with valid-but-empty tables so the resident heap is the
+            // compact index alone, not the full graph.
+            logPhase('index-only early return (graph build skipped)');
+            return {
+                fileSize: src.byteLength,
+                schemaVersion,
+                entityCount: totalEntities,
+                parseTime: performance.now() - startTime,
+                source: src,
+                entityIndex,
+                strings,
+                entities: entityTableBuilder.build(),
+                properties: propertyTableBuilder.build(),
+                quantities: quantityTableBuilder.build(),
+                relationships: relationshipGraphBuilder.build(),
+            };
+        }
+
         // === TARGETED PARSING using batch byte-level extraction ===
         // Uses 2 TextDecoder.decode() calls total for ALL entity GlobalIds/Names
         // (instead of per-entity calls), and pure byte scanning for relationships.
         options.onProgress?.({ phase: 'parsing entities', percent: 10 });
 
-        const extractor = new EntityExtractor(uint8Buffer);
+        const extractor = new EntityExtractor(src);
 
         // Spatial entities: small count, use extractEntity for full accuracy
         const parsedEntityData = new Map<number, { globalId: string; name: string }>();
@@ -402,12 +480,12 @@ export class ColumnarParser {
 
         // Geometry + type object entities: batch extract GlobalId+Name with 2 TextDecoder calls
         options.onProgress?.({ phase: 'parsing geometry names', percent: 12 });
-        const geomData = await batchExtractGlobalIdAndName(uint8Buffer, geometryRefs, yieldIfNeeded);
+        const geomData = await batchExtractGlobalIdAndName(src, geometryRefs, yieldIfNeeded);
         for (const [id, data] of geomData) parsedEntityData.set(id, data);
 
         await yieldIfNeeded();
 
-        const typeData = await batchExtractGlobalIdAndName(uint8Buffer, typeObjectRefs, yieldIfNeeded);
+        const typeData = await batchExtractGlobalIdAndName(src, typeObjectRefs, yieldIfNeeded);
         for (const [id, data] of typeData) parsedEntityData.set(id, data);
         logPhase('batch geom GlobalId+Name');
 
@@ -420,7 +498,7 @@ export class ColumnarParser {
             if ((i & 0x3FF) === 0) await yieldIfNeeded();
             const ref = relationshipRefs[i];
             const typeUpper = getTypeUpper(ref.type);
-            const rel = extractRelFast(uint8Buffer, ref.byteOffset, ref.byteLength, typeUpper);
+            const rel = extractRelFast(src.subarray(ref.byteOffset, ref.byteOffset + ref.byteLength), 0, ref.byteLength, typeUpper);
             if (rel) {
                 const relType = REL_TYPE_MAP[typeUpper];
                 if (relType) {
@@ -478,7 +556,7 @@ export class ColumnarParser {
 
         // === EXTRACT LENGTH UNIT SCALE ===
         options.onProgress?.({ phase: 'extracting units', percent: 85 });
-        const lengthUnitScale = extractLengthUnitScale(uint8Buffer, entityIndex);
+        const lengthUnitScale = extractLengthUnitScale(src, entityIndex);
 
         // === BUILD SPATIAL HIERARCHY ===
         options.onProgress?.({ phase: 'building hierarchy', percent: 90 });
@@ -490,7 +568,7 @@ export class ColumnarParser {
                 entityTable,
                 hierarchyRelGraph,
                 strings,
-                uint8Buffer,
+                src,
                 entityIndex,
                 lengthUnitScale
             );
@@ -504,11 +582,17 @@ export class ColumnarParser {
         // parsing continues. This lets the panel appear at the same time as
         // geometry streaming completes.
         const earlyStore: IfcDataStore = {
-            fileSize: buffer.byteLength,
+            fileSize: src.byteLength,
             schemaVersion,
             entityCount: totalEntities,
             parseTime: performance.now() - startTime,
-            source: uint8Buffer,
+            // `src` is the SourceReader seam: a real Uint8Array for the
+            // in-memory path (zero-copy `subarray` views) or an OPFS-backed
+            // OpfsSourceBuffer when the caller supplied `options.sourceReader`.
+            // In the OPFS case the full N bytes were never materialized into a
+            // contiguous heap buffer — on-demand extraction reads byte ranges
+            // (disk reads) through this same seam.
+            source: src,
             entityIndex,
             strings,
             entities: entityTable,
@@ -544,7 +628,7 @@ export class ColumnarParser {
         for (let pi = 0; pi < propertyRelRefs.length; pi++) {
             if ((pi & 0x3FF) === 0) await yieldIfNeeded();
             const ref = propertyRelRefs[pi];
-            const result = extractPropertyRelFast(uint8Buffer, ref.byteOffset, ref.byteLength);
+            const result = extractPropertyRelFast(src.subarray(ref.byteOffset, ref.byteOffset + ref.byteLength), 0, ref.byteLength);
             if (result) {
                 const { relatedObjects, relatingDef } = result;
                 totalPropRelObjects += relatedObjects.length;
@@ -579,7 +663,7 @@ export class ColumnarParser {
         for (let i = 0; i < associationRelRefs.length; i++) {
             if ((i & 0x3FF) === 0) await yieldIfNeeded();
             const ref = associationRelRefs[i];
-            const result = extractPropertyRelFast(uint8Buffer, ref.byteOffset, ref.byteLength);
+            const result = extractPropertyRelFast(src.subarray(ref.byteOffset, ref.byteOffset + ref.byteLength), 0, ref.byteLength);
             if (result) {
                 const { relatedObjects, relatingDef: relatingRef } = result;
                 const typeUpper = getTypeUpper(ref.type);
@@ -651,7 +735,7 @@ export class ColumnarParser {
         entityId: number
     ): Array<{ name: string; globalId?: string; properties: Array<{ name: string; type: number; value: PropertyValue; values?: string[]; dataType?: string }> }> {
         // Use on-demand extraction if map is available (preferred for single-entity access)
-        if (!store.onDemandPropertyMap || !store.source?.length) {
+        if (!store.onDemandPropertyMap || !store.source?.byteLength) {
             // Fallback to pre-computed property table (e.g., server-parsed data)
             return store.properties.getForEntity(entityId);
         }
@@ -721,7 +805,7 @@ export class ColumnarParser {
         entityId: number
     ): Array<{ name: string; quantities: Array<{ name: string; type: number; value: number }> }> {
         // Use on-demand extraction if map is available (preferred for single-entity access)
-        if (!store.onDemandQuantityMap || !store.source?.length) {
+        if (!store.onDemandQuantityMap || !store.source?.byteLength) {
             // Fallback to pre-computed quantity table (e.g., server-parsed data)
             return store.quantities.getForEntity(entityId);
         }
